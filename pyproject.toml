@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uapp-dash"
+# 版はパッケージ側の __version__ が正（doctor が PATH のコマンドと突き合わせるため二重管理にしない）
+dynamic = ["version"]
+description = "複数 Unity プロジェクトの並行 AI 開発を監視するファイルベースのダッシュボード"
+requires-python = ">=3.10"
+dependencies = []
+
+# 導入検証用の同梱テスト（tests/test_installed_smoke.py）を動かすためだけの任意依存。
+# 本体の実行には何も要らない
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+# コマンド名は uapp-dash に統一する。短い `dash` は別名としても置かない:
+#   - Debian 系の POSIX シェル /usr/bin/dash と衝突する
+#     （実際に別環境の AI が `dash begin` でシェルを起動して失敗した）
+#   - 一般名すぎて他者の自作ツールとも衝突しやすい
+# 名前空間はキット側（uapp_e2e / UAPP_E2E_* / UAPP_DASH_*）と揃える
+uapp-dash = "uapp_dash.cli:main"
+uapp-dash-emit = "uapp_dash.emit:main"
+
+[tool.setuptools]
+packages = ["uapp_dash"]
+
+[tool.setuptools.dynamic]
+version = {attr = "uapp_dash.__version__"}
+
+[tool.setuptools.package-data]
+uapp_dash = ["viewer.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

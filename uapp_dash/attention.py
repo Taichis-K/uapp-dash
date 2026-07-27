@@ -1,0 +1,175 @@
+"""派生状態の計算と「要注意ファースト」の並び替え（判断 B / C）。
+
+stalled / crashed は宣言できない。ここでだけ付与する。
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+from . import protocol as P
+from .proc import alive_on_this_host
+
+
+def _derived(state: str, declared: str, reasons: list, warnings: list,
+             overdue_sec: int, alive) -> dict:
+    """派生情報の形を 1 か所で決める。
+
+    途中 return ごとに手で組み立てていたため、**終了済みの単位に種別が付かず、
+    失敗が要注意の件数から漏れていた**（実運用で発覚）。
+    """
+    return {
+        "state": state, "declaredState": declared, "reasons": reasons, "warnings": warnings,
+        "overdueSec": overdue_sec, "alive": alive,
+        "terminal": state in P.TERMINAL_STATES,
+        "attentionCategory": category_of(state),
+        "attentionRank": rank(state),
+        # 生存を判定できたか。**pid を持たない単位では常に False**（AI はコマンドごとに
+        # 別プロセスなので pid を書けない）＝ crashed は付かず stalled 止まりになる。
+        # 表示側がこれを見て「停滞と消失を区別できない」ことを明示できるようにする
+        "livenessKnown": alive is not None,
+    }
+
+
+def derive(unit: dict, *, now: datetime | None = None, grace: int = P.STALL_GRACE_SEC) -> dict:
+    """単位に派生状態を付ける。戻り値は表示用の追加フィールド。"""
+    now = now or P.now()
+    declared = unit.get("state") or "running"
+    reasons: list[str] = []
+    warnings: list[str] = []
+
+    if unit.get("kind") == "ambient":
+        # 作業単位の宣言が無いエビデンスの入れ物。止まっていて当然なので停滞判定しない
+        return _derived("idle", declared, reasons, warnings, 0, None)
+
+    if declared == "done":
+        result = unit.get("result") or "success"
+        state = {"success": "done", "failure": "failed", "aborted": "aborted"}.get(result, "done")
+        if state != "done":
+            reasons.append(f"{'失敗' if state == 'failed' else '中断'}で終了: "
+                           f"{(unit.get('result') or '')}")
+        return _derived(state, declared, reasons, warnings, 0, None)
+
+    heartbeat, warn = P.parse_iso_safe(unit.get("lastHeartbeat") or unit.get("startedAt"))
+    if warn:
+        warnings.append(warn)
+    ttl = unit.get("ttlSec")
+    ttl = int(ttl) if isinstance(ttl, int) or (isinstance(ttl, str) and str(ttl).isdigit()) else P.DEFAULT_TTL_SEC
+
+    overdue_sec = 0
+    state = declared
+    alive = alive_on_this_host(unit.get("owner"))
+
+    # 人待ちの状態（blocked / waiting-approval / review）は、止まっているのが正常なので
+    # 停滞判定の対象にしない。もともと要注意順の上位に居るため見落とさない
+    human_wait = declared in ("blocked", "waiting-approval", "review")
+
+    if heartbeat is None:
+        warnings.append("lastHeartbeat も startedAt も読めない")
+    elif not human_wait:
+        deadline = P.overdue_after(heartbeat, ttl, grace)
+        if now > deadline:
+            overdue_sec = int((now - deadline).total_seconds())
+            if alive is False:
+                state = "crashed"
+                reasons.append(f"ハートビート途絶（{overdue_sec}秒超過）＋プロセス消失")
+            else:
+                state = "stalled"
+                note = "生存確認不能" if alive is None else "プロセスは生存"
+                reasons.append(f"ハートビート途絶（{overdue_sec}秒超過・{note}）")
+
+    if declared in ("blocked", "waiting-approval"):
+        blocked = unit.get("blocked") or {}
+        if declared == "blocked" and blocked.get("needs") == "approval":
+            state = "waiting-approval"
+        reasons.append(blocked.get("reason") or ("承認待ち" if state == "waiting-approval" else "ブロック中"))
+
+    return _derived(state, declared, reasons, warnings, overdue_sec, alive)
+
+
+def rank(state: str) -> int:
+    try:
+        return P.ATTENTION_ORDER.index(state)
+    except ValueError:
+        return len(P.ATTENTION_ORDER)
+
+
+def category_of(state: str) -> str | None:
+    """要注意の種類（human / incident / watch）。要注意でなければ None。"""
+    return P.CATEGORY_OF_STATE.get(state)
+
+
+def last_update(unit: dict) -> datetime | None:
+    for key in ("endedAt", "lastHeartbeat", "startedAt"):
+        parsed, _ = P.parse_iso_safe(unit.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def sort_units(units: list[dict], *, now: datetime | None = None) -> list[dict]:
+    """要注意ファースト。同順位内は最終更新が古い順（放置されているものを上に）。"""
+    now = now or P.now()
+
+    def key(unit: dict):
+        state = (unit.get("derived") or {}).get("state") or unit.get("state") or "running"
+        updated = last_update(unit)
+        age = (now - updated).total_seconds() if updated else float("inf")
+        return (rank(state), -age)
+
+    return sorted(units, key=key)
+
+
+def progress(unit: dict) -> dict:
+    tasks = unit.get("tasks") or []
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    dropped = sum(1 for t in tasks if t.get("status") == "dropped")
+    total = len(tasks)
+    return {"done": done, "dropped": dropped, "total": total,
+            "ratio": (done / (total - dropped)) if total - dropped > 0 else None}
+
+
+def detect_mismatch(unit: dict, events: list[dict]) -> list[dict]:
+    """自己申告とエビデンスの食い違いを拾う（二層化の実利）。
+
+    - タスク完了申告の後に、同じ単位で赤いエビデンスが出ている
+    - 成功で終了したのに、直前のエビデンスが赤い
+    """
+    findings: list[dict] = []
+    last_claim_done: dict | None = None
+    last_evidence_red: dict | None = None
+
+    for event in events:
+        kind = event.get("kind") or ""
+        data = event.get("data") or {}
+        if kind == "claim.task" and data.get("status") == "done":
+            last_claim_done = event
+            last_evidence_red = None
+            continue
+        if kind.startswith("evidence."):
+            ok = P.evidence_ok(data)
+            if ok is False:
+                last_evidence_red = event
+                if last_claim_done is not None:
+                    findings.append(
+                        {
+                            "severity": "mismatch",
+                            "at": event.get("at"),
+                            "message": (
+                                f"タスク「{(last_claim_done.get('data') or {}).get('taskId')}」を完了と申告した後に "
+                                f"{kind} が失敗している"
+                            ),
+                        }
+                    )
+                    last_claim_done = None
+            elif ok is True:
+                last_evidence_red = None
+            continue
+        if kind == "claim.end" and data.get("result") == "success" and last_evidence_red is not None:
+            findings.append(
+                {
+                    "severity": "mismatch",
+                    "at": event.get("at"),
+                    "message": f"成功として終了したが、直前の {last_evidence_red.get('kind')} が失敗している",
+                }
+            )
+    return findings
