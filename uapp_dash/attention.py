@@ -11,17 +11,23 @@ from .proc import alive_on_this_host
 
 
 def _derived(state: str, declared: str, reasons: list, warnings: list,
-             overdue_sec: int, alive) -> dict:
+             overdue_sec: int, alive, acknowledged: bool = False) -> dict:
     """派生情報の形を 1 か所で決める。
 
     途中 return ごとに手で組み立てていたため、**終了済みの単位に種別が付かず、
     失敗が要注意の件数から漏れていた**（実運用で発覚）。
     """
+    terminal = state in P.TERMINAL_STATES
+    # 人が「確認した」と記録した終了済みの失敗・中断は要注意から外す。
+    # これが無いと、終わった失敗が永久に要注意欄へ居座り、本当に手を貸すべきものが埋もれる
+    # （実運用で発覚。掃除のためにファイルごと消す羽目になった）
+    category = None if (terminal and acknowledged) else category_of(state)
     return {
         "state": state, "declaredState": declared, "reasons": reasons, "warnings": warnings,
         "overdueSec": overdue_sec, "alive": alive,
-        "terminal": state in P.TERMINAL_STATES,
-        "attentionCategory": category_of(state),
+        "terminal": terminal,
+        "acknowledged": acknowledged,
+        "attentionCategory": category,
         "attentionRank": rank(state),
         # 生存を判定できたか。**pid を持たない単位では常に False**（AI はコマンドごとに
         # 別プロセスなので pid を書けない）＝ crashed は付かず stalled 止まりになる。
@@ -36,6 +42,7 @@ def derive(unit: dict, *, now: datetime | None = None, grace: int = P.STALL_GRAC
     declared = unit.get("state") or "running"
     reasons: list[str] = []
     warnings: list[str] = []
+    acknowledged = bool(unit.get("acknowledgedAt"))
 
     if unit.get("kind") == "ambient":
         # 作業単位の宣言が無いエビデンスの入れ物。止まっていて当然なので停滞判定しない
@@ -47,7 +54,9 @@ def derive(unit: dict, *, now: datetime | None = None, grace: int = P.STALL_GRAC
         if state != "done":
             reasons.append(f"{'失敗' if state == 'failed' else '中断'}で終了: "
                            f"{(unit.get('result') or '')}")
-        return _derived(state, declared, reasons, warnings, 0, None)
+            if acknowledged:
+                reasons.append(f"確認済み（{unit.get('acknowledgedAt')}）")
+        return _derived(state, declared, reasons, warnings, 0, None, acknowledged)
 
     heartbeat, warn = P.parse_iso_safe(unit.get("lastHeartbeat") or unit.get("startedAt"))
     if warn:
@@ -164,12 +173,37 @@ def detect_mismatch(unit: dict, events: list[dict]) -> list[dict]:
             elif ok is True:
                 last_evidence_red = None
             continue
-        if kind == "claim.end" and data.get("result") == "success" and last_evidence_red is not None:
-            findings.append(
-                {
-                    "severity": "mismatch",
-                    "at": event.get("at"),
-                    "message": f"成功として終了したが、直前の {last_evidence_red.get('kind')} が失敗している",
-                }
-            )
+        if kind == "claim.end":
+            if data.get("result") == "success" and last_evidence_red is not None:
+                findings.append(
+                    {
+                        "severity": "mismatch",
+                        "at": event.get("at"),
+                        "message": f"成功として終了したが、直前の {last_evidence_red.get('kind')} が失敗している",
+                    }
+                )
+            continue
+
+    # **終了した後に届いた失敗**も拾う（ラッパーの記録は終了申告と競合しうる。
+    # 解決とジャーナル追記の間に end が入ると、成功で閉じた単位の後ろに赤が並ぶ）
+    ended_at, ended_success = None, False
+    for event in events:
+        if (event.get("kind") or "") == "claim.end":
+            ended_at = event.get("at")
+            ended_success = (event.get("data") or {}).get("result") == "success"
+    if ended_at and ended_success:
+        for event in events:
+            kind = event.get("kind") or ""
+            if not kind.startswith("evidence."):
+                continue
+            if str(event.get("at") or "") <= str(ended_at):
+                continue
+            if P.evidence_ok(event.get("data") or {}) is False:
+                findings.append(
+                    {
+                        "severity": "mismatch",
+                        "at": event.get("at"),
+                        "message": f"成功として終了した後に {kind} が失敗している（終了申告 {ended_at} より後の記録）",
+                    }
+                )
     return findings

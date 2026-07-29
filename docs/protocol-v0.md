@@ -133,8 +133,17 @@ flowchart LR
 追記の約束（複数プロセスが同じジャーナルへ書きうるため）:
 
 - **1 行は短く保つ**（数百バイト目安）。OS は任意長の追記の原子性を保証しない
+- **単位の解決（ツール側）**: `uapp-dash-emit` は「明示 `--unit-id` → 環境変数 →
+  **進行中の単位がちょうど 1 件ならその単位** → `ambient-<host>`」の順で決める。
+  ラッパーは AI と別プロセスで動くため unitId も環境変数も届かないことが多く、そのままでは
+  申告中の作業とエビデンスが別々の単位に入り、**単位レベルで申告と実測を突き合わせられない**
+  （二層化の目的が成立しない）。進行中が 0 件（誰の作業でもない）か 2 件以上（どちらか決められない）なら
+  `ambient` のままにする。自動で結びつけた場合は `data.unitIdSource = "active-unit"` を残し、
+  後から根拠を辿れるようにする
 - **`seq` はベストエフォート**。単位の所有者は通し番号を付けてよいが、外部の道具は `0`（不明）を書く。
-  読み手は `seq` の連番性・一意性に依存してはならない
+  読み手は `seq` の連番性・一意性に依存してはならない。
+  **`uapp-dash-emit` は常に `0` を書く**（並行追記では通し番号を保証できないため採番しない）。
+  **同一単位内の前後関係は `at` で見る**こと。ツールの記録が全件 `0` に見えても壊れてはいない
 - **読み手は壊れた行を黙って捨てる**（追記途中の欠けた行を掴んでも止まらないこと）
 - **読み手が `at` で並べ直し、完全に同一の行は 1 件に畳む**。退避時の追記マージで前後が入れ替わったり、
   途中で落ちた再実行で同じ行が二重に入っても、表示が壊れないようにする
@@ -161,7 +170,7 @@ flowchart LR
 | `evidence.e2e` | 上記＋ `journeyReport?, regressed?, failureDir?` |
 | `evidence.build` | `target, exitCode, durationSec, artifactPath?, sizeBytes?` |
 | `evidence.git` | `action: commit\|branch, sha, subject, files, branch` |
-| `evidence.resource` | `resource, action: acquire\|release\|denied\|wait, holder` |
+| `evidence.resource` | `resource, action: acquire\|release\|denied\|wait, holder` — **集約側は最新の `acquire` を「保持中」として資源パネルに出し、`release` で消す**（`source: "tool"` が付く）。ラッパー側のロック（キットのプロセス間 Mutex 等）は AI の申告に依存せず効くので、これを記録すると「効くほう」と「見えるほう」が一致する。申告レーン（`resources/` の実ファイル）に同じ資源があればそちらを優先する |
 | `evidence.device` | `serial, load1, uptimeSec, ports[]` |
 
 **エビデンスの成否判定**: `data.ok` があればそれ。無ければ `exitCode == 0` かつ `failed == 0` を成功とする。

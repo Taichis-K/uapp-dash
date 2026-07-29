@@ -111,6 +111,12 @@ uapp-dash-emit evidence.test --set suite=unit --set passed=1 --set failed=0 --se
 
 `.agent-status/` が無いプロジェクトでは**何も起きないのが正しい**（完全な no-op）。
 
+- `--project` は**サブコマンドの前後どちらに置いてもよい**（`uapp-dash --project <対象> init` と
+  `uapp-dash init --project <対象>` は同じ。`uapp-dash-emit` も同様）。AI がコマンドを組み立てるときに
+  位置を気にしなくてよい
+- **`doctor` の「ツール側エミッタの配線」は記録の実績で判定する**。この疎通で 1 件記録すれば [済] になり、
+  以後は自前ラッパーからでも CI からでも、記録さえ出ていれば配線の形は問わない
+
 ### 4. 自己診断
 
 ```powershell
@@ -140,6 +146,13 @@ uapp-dash view --serve --open          # 5 秒ごとに更新される表示（�
   `cloudflared tunnel --url http://127.0.0.1:8788` でトンネルを張って表示された URL を開く。
   **URL を知っている人は誰でも見られる**（プロジェクトの絶対パス・ホスト名・作業ラベルが出る）ので、
   ユーザーに確認してから使い、不要になったら止める
+- **1 プロジェクトだけを見る場合**は `--serve` を常駐させる動機が弱い。検証スクリプトの末尾で
+  HTML を更新しておき、見たいときに開くほうが合う:
+
+  ```powershell
+  # verify.ps1 / run-e2e.ps1 等の末尾に 1 行
+  uapp-dash view --out "$PSScriptRoot\..\Builds\fleet.html"
+  ```
 
 ### 6. ツール側の自動エビデンス配線（任意）
 

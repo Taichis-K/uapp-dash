@@ -19,13 +19,70 @@ from .store import StatusStore
 AMBIENT_PREFIX = "ambient-"
 
 
-def resolve_unit_id(explicit: str | None = None, env: dict | None = None) -> str:
+SOURCE_EXPLICIT = "explicit"
+SOURCE_ENV = "env"
+SOURCE_ACTIVE = "active-unit"
+SOURCE_AMBIENT = "ambient"
+
+
+def sole_active_unit(store: StatusStore | None) -> str | None:
+    """進行中の単位が**ちょうど 1 件**ならその unitId。それ以外は None。
+
+    ラッパー（run-e2e.ps1 / verify.ps1 等）は AI から別プロセスで起動されるため、
+    環境変数も unitId も届かない。その結果、申告している最中の作業でもエビデンスだけが
+    `ambient-<host>` に落ち、**単位レベルで申告と実測を突き合わせられなかった**
+    （二層化の目的そのものが成立しない）。
+
+    候補を絞る条件（**推測で結びつけない**ための線引き）:
+
+    - **このホストが所有する単位だけ**。`.agent-status` を共有している場合、
+      別マシンで動いている他人の作業にこちらの実測値を付けてしまう
+    - **ハートビートが切れていない単位だけ**。放置された単位に後日の実測値が付くと、
+      その単位の申告と実測がまるで同時のものに見える
+    - 該当が 0 件（誰の作業でもない）／2 件以上（どちらか決められない）なら ambient のまま
+    """
+    if store is None or not store.exists():
+        return None
+    here = hostname()
+    now = P.now()
+    found: list[str] = []
+    for unit in store.list_units(include_done=False):
+        unit_id = unit.get("unitId")
+        if not unit_id or unit.get("state") in P.TERMINAL_STATES:
+            continue
+        owner_host = (unit.get("owner") or {}).get("host")
+        if owner_host and owner_host != here:
+            continue                       # 別マシンの作業に付けない
+        heartbeat, _ = P.parse_iso_safe(unit.get("lastHeartbeat") or unit.get("startedAt"))
+        if heartbeat is not None and now > P.overdue_after(heartbeat, int(unit.get("ttlSec") or 0)):
+            continue                       # 停滞している単位には付けない
+        found.append(unit_id)
+        if len(found) > 1:
+            return None                    # 2 件見つかった時点で決められない（走査も打ち切る）
+    return found[0] if found else None
+
+
+def resolve_unit_id(explicit: str | None = None, env: dict | None = None,
+                    store: StatusStore | None = None) -> str:
+    """記録先の unitId を決める。**戻り値は従来どおり文字列**（外部の呼び出しを壊さない）。"""
+    return resolve_unit_id_with_source(explicit, env, store)[0]
+
+
+def resolve_unit_id_with_source(explicit: str | None = None, env: dict | None = None,
+                                store: StatusStore | None = None) -> tuple[str, str]:
+    """(unitId, 解決根拠) を返す。根拠は記録に残して**後から辿れる**ようにする。"""
     env = os.environ if env is None else env
-    for candidate in (explicit, env.get("UAPP_DASH_UNIT_ID"), env.get("UAPP_E2E_UNIT_ID")):
+    if explicit and P.valid_unit_id(explicit):
+        return explicit, SOURCE_EXPLICIT
+    for key in ("UAPP_DASH_UNIT_ID", "UAPP_E2E_UNIT_ID"):
+        candidate = env.get(key)
         if candidate and P.valid_unit_id(candidate):
-            return candidate
+            return candidate, SOURCE_ENV
+    active = sole_active_unit(store)
+    if active:
+        return active, SOURCE_ACTIVE
     # 誰の作業か分からなくても、プロジェクト単位では見えるようにする
-    return f"{AMBIENT_PREFIX}{hostname()}"
+    return f"{AMBIENT_PREFIX}{hostname()}", SOURCE_AMBIENT
 
 
 def _coerce(value: str):
@@ -80,7 +137,10 @@ def emit(kind: str, data: dict, *, project: Path | None = None, unit_id: str | N
             return None  # ダッシュボード未導入環境では完全な no-op
     store.ensure()
 
-    unit_id = resolve_unit_id(unit_id)
+    unit_id, source = resolve_unit_id_with_source(unit_id, store=store)
+    if source == SOURCE_ACTIVE:
+        # 自動で結びつけたことを記録に残す（後から「なぜこの単位に入ったのか」を辿れるように）
+        data = {**(data or {}), "unitIdSource": SOURCE_ACTIVE}
     # seq は採番しない（0＝不明）。並行追記では通し番号を保証できず、読み手も順序に依存しない
     return store.append_event(unit_id, kind, data, P.PRODUCER_TOOL, seq=0)
 

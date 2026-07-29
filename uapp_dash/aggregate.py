@@ -142,16 +142,27 @@ def safe_link(value):
     **制御文字を含む値は無条件で拒否する**。`java&#9;script:` のようにタブ・改行を挟むと
     正規表現ではスキーム無し（相対パス）に見えるが、ブラウザの URL 解析はそれらを取り除いて
     `javascript:` として実行する。
+
+    **リモートを指すファイルパスも拒否する**。`\\\\attacker\\share\\x` や
+    `file://attacker/share/x` は、クリックした瞬間に Windows が SMB 接続を試み、
+    環境によっては資格情報のネゴシエーションまで進む。値を書くのは外部ツールなので、
+    ローカルの絶対パス（`C:\\…` / `/…` / `file:///…`）だけを通す。
     """
     if not isinstance(value, str) or not value.strip():
         return None
     if _CONTROL_CHARS.search(value):
         return None
     text = value.strip()
-    if _WINDOWS_DRIVE.match(text) or text.startswith("\\\\") or text.startswith("/"):
+    if text.startswith("\\\\"):
+        return None                      # UNC（リモート共有）
+    if _WINDOWS_DRIVE.match(text) or text.startswith("/"):
         return text                      # ローカルパス（絶対）
     if _SCHEME.match(text):
-        return text if text.lower().startswith(_SAFE_SCHEMES) else None
+        lowered = text.lower()
+        if lowered.startswith("file:"):
+            # file:///… （ホスト無し）だけ通す。file://host/share は SMB を引きにいく
+            return text if lowered.startswith("file:///") else None
+        return text if lowered.startswith(_SAFE_SCHEMES) else None
     if ":" in text.split("/", 1)[0]:
         return None                      # 先頭要素にコロン＝解釈が割れる形は通さない
     return text                          # 相対パス
@@ -191,6 +202,66 @@ def _activity_buckets(units: list[dict], *, now: datetime) -> list[int]:
                 continue
             buckets[ACTIVITY_BUCKETS - 1 - int(delta // ACTIVITY_BUCKET_SEC)] += 1
     return buckets
+
+
+def _tool_held_resources(units: list[dict], declared: list[dict]) -> list[dict]:
+    """**ツールが記録した排他**（キットのプロセス間 Mutex 等）も資源パネルに載せる。
+
+    ラッパー側のロックは AI の申告に依存せず確実に効くが、これまで画面に出ていなかった。
+    「効くほう（ツールのロック）」と「見えるほう（申告した資源）」が別だと、
+    人は取り合いが起きても画面から原因を追えない。
+
+    申告レーン（`resources/` の実ファイル）に同じ資源があればそちらを優先する
+    （実ロックの方が情報が多く、解放の責任所在もはっきりしている）。
+    """
+    latest: dict[str, dict] = {}
+    for unit in units:
+        for event in unit.get("_events", []):
+            if event.get("kind") != "evidence.resource":
+                continue
+            data = event.get("data") or {}
+            resource = str(data.get("resource") or "")
+            if not resource:
+                continue
+            at = str(event.get("at") or "")
+            current = latest.get(resource)
+            if current is None or at >= current["at"]:
+                latest[resource] = {"at": at, "action": str(data.get("action") or ""),
+                                    "data": data, "unit": unit}
+
+    known = {str(record.get("resource") or "") for record in declared}
+    held = []
+    for resource, record in sorted(latest.items()):
+        if record["action"] != "acquire" or resource in known:
+            continue                      # release / denied / wait は保持ではない
+        unit = record["unit"]
+        holder = record["data"].get("holder") or {
+            "unitId": unit.get("unitId"), "label": unit.get("label"),
+            "host": (unit.get("owner") or {}).get("host"),
+        }
+        held.append({"resource": resource, "holder": holder, "acquiredAt": record["at"],
+                     "source": P.PRODUCER_TOOL, "holderAlive": alive_on_this_host(holder)})
+    return held
+
+
+def _recent_events(events: list[dict]) -> list[dict]:
+    """表示に渡すイベント。**赤いエビデンスと終了申告は窓から落とさない**。
+
+    単純に末尾 N 件で切ると、イベントを連打するだけで失敗の記録が窓の外へ押し出され、
+    画面上は「実測は緑だけ」に見える（＝自分の失敗を隠せる）。二層化の目的に反するので、
+    失敗したエビデンスと claim.end は件数に関わらず残す。
+    """
+    tail = events[-MAX_RECENT_EVENTS:]
+    kept = list(tail)
+    seen = {id(event) for event in tail}
+    for event in events[:-MAX_RECENT_EVENTS] if len(events) > MAX_RECENT_EVENTS else []:
+        kind = event.get("kind") or ""
+        important = kind == "claim.end" or (
+            kind.startswith("evidence.") and P.evidence_ok(event.get("data") or {}) is False)
+        if important and id(event) not in seen:
+            kept.append(event)
+    kept.sort(key=lambda e: str(e.get("at") or ""))
+    return kept
 
 
 def _latest_evidence(events: list[dict]) -> dict | None:
@@ -255,7 +326,8 @@ def build_project(project_root: Path, *, now: datetime | None = None) -> dict:
         if latest and str(latest.get("at") or "") >= str((unit.get("lastEvidence") or {}).get("at") or ""):
             unit["lastEvidence"] = latest
         unit["_events"] = events
-        unit["recentEvents"] = events[-MAX_RECENT_EVENTS:]
+        unit["recentEvents"] = _recent_events(events)
+        unit["eventTotal"] = len(events)
         warnings.extend(derived.get("warnings") or [])
         enriched.append(unit)
 
@@ -263,6 +335,7 @@ def build_project(project_root: Path, *, now: datetime | None = None) -> dict:
     for record in store.list_resources():
         holder = record.get("holder") or {}
         resources.append({**record, "holderAlive": alive_on_this_host(holder)})
+    resources += _tool_held_resources(enriched, resources)
 
     devices = _device_panel(enriched, store)
     buckets = _activity_buckets(enriched, now=now)
@@ -377,6 +450,18 @@ def build_fleet(projects: list[Path] | None = None, *, now: datetime | None = No
             project["displayName"] = f"{parent}/{project['name']}" if parent else project["name"]
         else:
             project["displayName"] = project["name"]
+
+    # projectId は表示側のリンク先（#/p/<projectId>）になる。SHA-1 の先頭 8 桁なので
+    # 衝突しうるし、壊れた入力で重複することもある。**重複したら別 ID にする**
+    # （同じ URL で 2 つのプロジェクトを指すと、詳細も ack のコマンドも別物が出る）
+    used: dict[str, int] = {}
+    for project in built:
+        base = project.get("projectId") or "unknown"
+        if base in used:
+            used[base] += 1
+            project["projectId"] = f"{base}-{used[base]}"
+        else:
+            used[base] = 0
 
     order = {name: index for index, name in enumerate(P.ATTENTION_CATEGORIES)}
 

@@ -252,6 +252,52 @@
   body.tv .card { padding: calc(9px * var(--scale)) calc(11px * var(--scale)); }
   body.tv .unitline { margin-top: calc(4px * var(--scale)); }
   body.tv .qwhy { -webkit-line-clamp: 1; }
+  /* --- 2 段目: プロジェクト詳細 / 単位詳細 --------------------------------
+     フリートは「どれに手を貸すか」を選ぶ画面。選んだ後に「何が起きたのか」を
+     見る場所が無いと、結局 .agent-status の生ファイルを読む羽目になる。
+     自己完結 HTML の制約は崩さない（別ページではなく同一ファイル内のビュー切替） */
+  /* main は display:grid を持つため、hidden 属性だけでは消えない（実測で両方描画された） */
+  [hidden] { display: none !important; }
+  .crumbs { display: flex; gap: calc(8px * var(--scale)); align-items: center; flex-wrap: wrap;
+            font-size: calc(12px * var(--scale)); color: var(--muted); margin-bottom: calc(10px * var(--scale)); }
+  .crumbs a { color: var(--blue); text-decoration: none; }
+  .crumbs a:hover { text-decoration: underline; }
+  .dhead { display: flex; align-items: baseline; gap: calc(10px * var(--scale)); flex-wrap: wrap;
+           margin-bottom: calc(10px * var(--scale)); }
+  .dhead h2 { margin: 0; }
+  .dhead .path { font-size: calc(11px * var(--scale)); color: var(--faint); word-break: break-all; }
+  /* 見出しのスパークラインは飾り。フリートのカード内と違って伸ばさない（全幅に広がって主役になる） */
+  .dhead .spark { flex: 0 0 auto; width: calc(120px * var(--scale)); }
+  /* 詳細では 1 行に収める必要が無い。切り捨てると理由の後半が読めない */
+  .dpanel .unitsub { white-space: normal; overflow: visible; text-overflow: clip;
+                     overflow-wrap: anywhere; margin-left: 0; }
+  .dgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+           gap: calc(12px * var(--scale)); }
+  .dpanel { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+            padding: calc(11px * var(--scale)); box-shadow: var(--cardshadow); }
+  .dpanel h3 { margin: 0 0 calc(8px * var(--scale)); font-size: calc(11px * var(--scale));
+               letter-spacing: .14em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+  .lanes { display: grid; grid-template-columns: 1fr 1fr; gap: calc(12px * var(--scale)); }
+  .lane .ln { display: grid; grid-template-columns: auto 1fr; gap: calc(8px * var(--scale));
+              padding: calc(4px * var(--scale)) 0; border-top: 1px dashed var(--edge);
+              font-size: calc(12px * var(--scale)); }
+  .lane .ln:first-of-type { border-top: none; }
+  .lane .ln.red { color: var(--red); }
+  .lane .ln .t { color: var(--faint); font-variant-numeric: tabular-nums; }
+  .tasklist { display: flex; flex-direction: column; gap: calc(4px * var(--scale)); }
+  .tasklist .tk { display: flex; gap: calc(8px * var(--scale)); font-size: calc(12px * var(--scale)); }
+  .tasklist .tk.done { color: var(--green); }
+  .tasklist .tk.dropped { color: var(--faint); text-decoration: line-through; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: calc(4px * var(--scale)) calc(10px * var(--scale));
+        font-size: calc(12px * var(--scale)); }
+  .kv .k { color: var(--muted); }
+  .cmd { font-family: ui-monospace, Consolas, monospace; font-size: calc(11px * var(--scale));
+         background: var(--panel2); border: 1px solid var(--edge); border-radius: 6px;
+         padding: calc(6px * var(--scale)); word-break: break-all; color: var(--fg); }
+  a.cardlink, a.rowlink { color: inherit; text-decoration: none; display: block; }
+  a.cardlink:focus-visible, a.rowlink:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  .unitline.clickable:hover .label { text-decoration: underline; }
+  @media (max-width: 820px) { .lanes { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -268,7 +314,7 @@
     <span class="feed" id="feed"></span>
   </div>
 </header>
-<main>
+<main id="fleetView">
   <div class="fleetstrip" id="fleetStrip"></div>
   <section>
     <h2>Project Matrix <span class="count" id="matrixCount"></span></h2>
@@ -279,6 +325,7 @@
     <div class="panel" id="unitsPanel"></div>
   </aside>
 </main>
+<main id="detailView" class="detail" hidden style="display:block"></main>
 <footer id="footer"></footer>
 <script>
 const FLEET = /*__FLEET_DATA__*/null;
@@ -389,12 +436,19 @@ function link(path) {
     return document.createTextNode(path);
   }
   const text = path.trim();
-  if (/^[a-zA-Z]:[\\/]/.test(text) || text.startsWith("\\\\") || text.startsWith("/")) {
+  // UNC（\\host\share）はリンクにしない: クリックで Windows が SMB 接続を試み、
+  // 環境によっては資格情報のネゴシエーションまで進む（値を書くのは外部ツール）
+  if (text.startsWith("\\\\")) return document.createTextNode(text);
+  if (/^[a-zA-Z]:[\\/]/.test(text) || text.startsWith("/")) {
     return el("a", {href: "file:///" + text.replace(/\\/g, "/")}, text);
   }
   const scheme = text.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
   if (!scheme) return el("a", {href: text}, text);
-  if (/^(https?|file)$/i.test(scheme[1])) return el("a", {href: text}, text);
+  if (/^file$/i.test(scheme[1])) {
+    // file:///… （ホスト無し）だけ許す。file://host/share は外部共有を引きにいく
+    return /^file:\/\/\//i.test(text) ? el("a", {href: text}, text) : document.createTextNode(text);
+  }
+  if (/^https?$/i.test(scheme[1])) return el("a", {href: text}, text);
   return document.createTextNode(text);
 }
 
@@ -441,11 +495,15 @@ function projectCard(project, index, showDone) {
   const flagColor = worst ? (worst.category === "watch" ? "amber" : "red") : (running ? "blue" : "slate");
   const card = el("article", {class: "card " + tone, style: `--pc: var(${paletteVar(project)})`,
                               "data-project": project.projectId || ""});
-  card.append(el("div", {class: "chead"},
-    el("span", {class: "sigil"}, sigilText(project.name)),
-    el("span", {class: "name"}, project.displayName || project.name),
-    el("span", {class: "flag", style: `--c: var(--${flagColor})`},
-      attn ? `!${attn}` : running ? "OK" : "IDLE")));
+  // 見出しから 2 段目（プロジェクト詳細）へ。カード全体をリンクにすると
+  // 中の details（開閉）やリンクが押せなくなるので、見出しだけをリンクにする
+  card.append(el("a", {class: "cardlink", href: projectHref(project),
+                       title: "プロジェクト詳細を開く"},
+    el("div", {class: "chead"},
+      el("span", {class: "sigil"}, sigilText(project.name)),
+      el("span", {class: "name"}, project.displayName || project.name),
+      el("span", {class: "flag", style: `--c: var(--${flagColor})`},
+        attn ? `!${attn}` : running ? "OK" : "IDLE"))));
   card.append(el("div", {class: "cmeta"},
     el("span", {class: "micro"}, `P${String(index + 1).padStart(2, "0")}`),
     el("span", {class: "micro"}, hhmm(project.lastActivityAt) + (running ? " ACTIVE" : " QUIET"))));
@@ -464,14 +522,15 @@ function projectCard(project, index, showDone) {
     const state = stateOf(unit);
     const prog = unit.progress || {};
     // 2 本目以降は常時表示モードで畳む（遠くから見るときは先頭 1 本で足りる）
-    card.append(el("div", {class: "unitline st-" + state + (index ? " rest" : "")},
-      el("span", {class: "dot" + (state === "running" ? " pulse" : "")}),
-      el("span", {class: "label"}, unit.label || unit.unitId),
-      el("span", {class: "state"}, (STATE[state] || {}).label || state)));
-    card.append(el("div", {class: "unitsub"},
-      el("span", {}, unit.activity || ((unit.derived || {}).reasons || [])[0] || ""),
-      el("span", {}, "·"), agoNode(unit.lastHeartbeat),
-      prog.total ? el("span", {}, `· ${prog.done}/${prog.total - prog.dropped}`) : null));
+    card.append(el("a", {class: "rowlink", href: unitHref(project, unit), title: "この作業の詳細を開く"},
+      el("div", {class: "unitline clickable st-" + state + (index ? " rest" : "")},
+        el("span", {class: "dot" + (state === "running" ? " pulse" : "")}),
+        el("span", {class: "label"}, unit.label || unit.unitId),
+        el("span", {class: "state"}, (STATE[state] || {}).label || state)),
+      el("div", {class: "unitsub"},
+        el("span", {}, unit.activity || ((unit.derived || {}).reasons || [])[0] || ""),
+        el("span", {}, "·"), agoNode(unit.lastHeartbeat),
+        prog.total ? el("span", {}, `· ${prog.done}/${prog.total - prog.dropped}`) : null)));
   });
   if (!units.length) card.append(el("div", {class: "unitsub", style: "margin-left:0"}, "進行中の作業なし"));
 
@@ -535,14 +594,19 @@ function queuePanel(fleet, projectsById) {
     const label = item.kind === "unit" ? (STATE[item.state] || {}).label || item.state : KIND[item.kind] || item.kind;
     // 優先度は**種類**で決まる（並び順の連番ではない）。人待ち=P0 / 障害=P1 / 様子見=P2
     const priority = item.category === "human" ? "P0" : item.category === "incident" ? "P1" : "P2";
-    panel.append(el("div", {class: "qrow cat-" + item.category},
-      el("div", {class: "qtop"},
-        el("span", {}, priority), el("span", {}, "·"), el("span", {}, label),
-        el("span", {class: "spacer"}), agoNode(item.sinceAt, "micro")),
-      el("div", {class: "qtitle"},
-        el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilText(project.name)),
-        " " + (item.project || "") + " / " + item.title),
-      el("div", {class: "qwhy"}, item.reason || CAT_LABEL[item.category] || "")));
+    // 単位に紐づく項目は単位詳細へ、それ以外（衝突・資源・デバイス）はプロジェクト詳細へ
+    const href = item.kind === "unit" && item.unitId
+      ? unitHref({projectId: item.projectId}, {unitId: item.unitId})
+      : projectHref({projectId: item.projectId});
+    panel.append(el("a", {class: "rowlink", href},
+      el("div", {class: "qrow cat-" + item.category},
+        el("div", {class: "qtop"},
+          el("span", {}, priority), el("span", {}, "·"), el("span", {}, label),
+          el("span", {class: "spacer"}), agoNode(item.sinceAt, "micro")),
+        el("div", {class: "qtitle"},
+          el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilText(project.name)),
+          " " + (item.project || "") + " / " + item.title),
+        el("div", {class: "qwhy"}, item.reason || CAT_LABEL[item.category] || ""))));
   });
   if (items.length > 8) panel.append(el("div", {class: "empty"}, `ほか ${items.length - 8} 件`));
 }
@@ -561,12 +625,13 @@ function unitsPanel(fleet, projectsById) {
   if (!rows.length) { panel.append(el("div", {class: "empty"}, "実行中の作業はありません")); return; }
   for (const [project, unit] of rows.slice(0, 14)) {
     const prog = unit.progress || {};
-    panel.append(el("div", {class: "urow", style: `--pc: var(${paletteVar(project)})`},
-      el("span", {class: "dot pulse", style: "--c: var(--blue)"}),
-      el("span", {class: "pn"}, project.displayName || project.name),
-      el("span", {class: "lb"}, unit.label || unit.unitId),
-      el("span", {class: "tm num"}, prog.total ? `${prog.done}/${prog.total - prog.dropped}` : ""),
-      agoNode(unit.lastHeartbeat, "tm num")));
+    panel.append(el("a", {class: "rowlink", href: unitHref(project, unit)},
+      el("div", {class: "urow", style: `--pc: var(${paletteVar(project)})`},
+        el("span", {class: "dot pulse", style: "--c: var(--blue)"}),
+        el("span", {class: "pn"}, project.displayName || project.name),
+        el("span", {class: "lb"}, unit.label || unit.unitId),
+        el("span", {class: "tm num"}, prog.total ? `${prog.done}/${prog.total - prog.dropped}` : ""),
+        agoNode(unit.lastHeartbeat, "tm num"))));
   }
 }
 function drawFooter(fleet) {
@@ -577,7 +642,10 @@ function drawFooter(fleet) {
   for (const project of fleet.projects || []) {
     for (const r of project.resources || []) {
       const holder = r.holder || {};
-      held.push(`${r.resource} → ${holder.label || holder.unitId || "?"}`);
+      // ツールのロック（ラッパーが記録したもの）は申告と区別する。
+      // 「効くほう」と「見えるほう」が同じ欄に並ぶので、どちらの由来かが分からないと追えない
+      const via = r.source === "tool" ? "（ツール）" : "";
+      held.push(`${r.resource} → ${holder.label || holder.unitId || "?"}${via}`);
     }
   }
   foot.append(el("span", {class: "k"}, "Exclusive Resources"),
@@ -616,18 +684,240 @@ function tickAges() {
   if (current) drawFeed(current);
 }
 
+/* ---------- 2 段目: プロジェクト詳細 / 単位詳細 ----------
+   ルーティングは location.hash だけで完結させる（--out の 1 ファイル出力でも遷移が効く）。
+   判定・並び順は集約側の値をそのまま使い、ここでは数え直さない */
+function route() {
+  // 壊れた hash（`#/p/%` 等）で decodeURIComponent が例外を投げると描画ごと止まる。
+  // URL は共有されるので、不正な値はフリート表示へ落として画面を殺さない
+  const decode = (s) => { try { return decodeURIComponent(s); } catch (e) { return null; } };
+  const parts = (location.hash || "").replace(/^#\/?/, "").split("/").filter(Boolean);
+  if (parts[0] === "p" && parts[1]) {
+    const projectId = decode(parts[1]);
+    return projectId ? {view: "project", projectId} : {view: "fleet"};
+  }
+  if (parts[0] === "u" && parts[1] && parts[2]) {
+    const projectId = decode(parts[1]), unitId = decode(parts[2]);
+    return (projectId && unitId) ? {view: "unit", projectId, unitId} : {view: "fleet"};
+  }
+  return {view: "fleet"};
+}
+function projectHref(project) { return "#/p/" + encodeURIComponent(project.projectId || ""); }
+function unitHref(project, unit) {
+  return "#/u/" + encodeURIComponent(project.projectId || "") + "/" + encodeURIComponent(unit.unitId || "");
+}
+function crumbs(...items) {
+  const box = el("div", {class: "crumbs"});
+  items.forEach((item, i) => {
+    if (i) box.append(el("span", {}, "›"));
+    box.append(item.href ? el("a", {href: item.href}, item.text) : el("span", {}, item.text));
+  });
+  return box;
+}
+function stateChip(unit) {
+  const state = stateOf(unit);
+  return el("span", {class: "unitline st-" + state, style: "display:inline-flex"},
+    el("span", {class: "dot" + (state === "running" ? " pulse" : "")}),
+    el("span", {class: "state"}, (STATE[state] || {}).label || state));
+}
+function laneRows(events, producer) {
+  const rows = events.filter(e => (e.producer || "") === producer);
+  if (!rows.length) return [el("div", {class: "empty"}, producer === "agent" ? "申告なし" : "実測なし")];
+  return rows.map(e => {
+    const red = e.kind.startsWith("evidence.") && (e.data || {}).ok === false;
+    const line = el("div", {class: "ln" + (red ? " red" : "")},
+      el("span", {class: "t"}, hhmm(e.at)), el("span", {}, eventText(e)));
+    const target = (e.data || {}).journeyReport || (e.data || {}).reportPath
+                || (e.data || {}).failureDir || (e.data || {}).logPath || (e.data || {}).xmlPath;
+    if (target) line.append(el("span", {}), el("span", {}, link(target)));
+    return line;
+  });
+}
+function drawUnitDetail(fleet, project, unit) {
+  const box = document.getElementById("detailView");
+  const derived = unit.derived || {};
+  const prog = unit.progress || {};
+  box.append(crumbs({text: "Fleet", href: "#/"},
+                    {text: project.displayName || project.name, href: projectHref(project)},
+                    {text: unit.label || unit.unitId}));
+  box.append(el("div", {class: "dhead"}, el("h2", {}, unit.label || unit.unitId), stateChip(unit),
+    el("span", {class: "path"}, unit.unitId)));
+
+  const grid = el("div", {class: "dgrid"});
+  const info = el("div", {class: "dpanel"}, el("h3", {}, "概要"));
+  const kv = el("div", {class: "kv"});
+  const rows = [
+    ["担当", `${(unit.owner || {}).agent || "不明"}${(unit.owner || {}).host ? " @ " + unit.owner.host : ""}`],
+    ["開始", unit.startedAt || "—"],
+    ["最終更新", unit.lastHeartbeat || "—"],
+    ["終了", unit.endedAt ? `${unit.endedAt}（${unit.result || ""}）` : "—"],
+    ["いま", unit.activity || "—"],
+    ["進捗", prog.total ? `${prog.done}/${prog.total - (prog.dropped || 0)}` : "—"],
+  ];
+  if (derived.acknowledged) rows.push(["確認済み", unit.acknowledgedAt + (unit.acknowledgedNote ? "（" + unit.acknowledgedNote + "）" : "")]);
+  for (const [k, v] of rows) { kv.append(el("span", {class: "k"}, k), el("span", {}, v)); }
+  info.append(kv);
+  for (const reason of derived.reasons || []) info.append(el("div", {class: "unitsub", style: "color:var(--amber);margin-left:0"}, "▸ " + reason));
+  for (const m of unit.mismatches || []) info.append(el("div", {class: "unitsub", style: "color:var(--red);margin-left:0"}, "⚠ " + m.message));
+  grid.append(info);
+
+  if ((unit.tasks || []).length) {
+    const panel = el("div", {class: "dpanel"}, el("h3", {}, "タスク"));
+    const list = el("div", {class: "tasklist"});
+    for (const task of unit.tasks) {
+      list.append(el("div", {class: "tk " + (task.status || "")},
+        el("span", {}, task.status === "done" ? "✔" : task.status === "dropped" ? "⊘" : "·"),
+        el("span", {}, task.title || task.id),
+        task.note ? el("span", {class: "micro"}, task.note) : null));
+    }
+    panel.append(list);
+    grid.append(panel);
+  }
+
+  if ((unit.claims || []).length || (unit.resources || []).length) {
+    const panel = el("div", {class: "dpanel"}, el("h3", {}, "宣言した領域と排他資源"));
+    if ((unit.claims || []).length) {
+      panel.append(el("div", {style: "display:flex;gap:5px;flex-wrap:wrap"},
+        unit.claims.map(c => el("span", {class: "pill"}, `${c.path}${c.mode === "exclusive" ? " [排他]" : ""}`))));
+    }
+    for (const r of unit.resources || []) panel.append(el("div", {class: "unitsub", style: "margin-left:0"}, "🔒 " + r));
+    grid.append(panel);
+  }
+
+  // 終了済みの失敗・中断は「確認した」と記録するまで要注意欄に残る。外し方をここに置く
+  // （静的 HTML から状態は書き換えられないので、打つべきコマンドを示す）
+  if (derived.terminal && derived.attentionCategory && !derived.acknowledged) {
+    grid.append(el("div", {class: "dpanel"}, el("h3", {}, "確認済みにする"),
+      el("div", {class: "unitsub", style: "margin-left:0"}, "対応が済んだら要注意欄から外せる"),
+      el("div", {class: "cmd"}, `uapp-dash --project ${project.path} ack --unit-id ${unit.unitId} --note "確認した内容"`)));
+  }
+  box.append(grid);
+
+  const events = (unit.recentEvents || []).slice().sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
+  const total = unit.eventTotal || events.length;
+  const lanes = el("div", {class: "lanes", style: "margin-top:12px"});
+  lanes.append(el("div", {class: "dpanel lane"}, el("h3", {}, "申告（エージェント）"), laneRows(events, "agent")));
+  lanes.append(el("div", {class: "dpanel lane"}, el("h3", {}, "客観エビデンス（ツール）"), laneRows(events, "tool")));
+  box.append(lanes);
+  // 表示件数を隠さない（全部出ていると思わせない）。失敗と終了申告は件数に関わらず残す設計
+  if (total > events.length) {
+    box.append(el("div", {class: "unitsub", style: "margin:8px 0 0"},
+      `表示は直近 ${events.length} 件（全 ${total} 件）。失敗したエビデンスと終了申告は件数に関わらず残す`));
+  }
+}
+function drawProjectDetail(fleet, project) {
+  const box = document.getElementById("detailView");
+  box.append(crumbs({text: "Fleet", href: "#/"}, {text: project.displayName || project.name}));
+  box.append(el("div", {class: "dhead"},
+    el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilText(project.name)),
+    el("h2", {}, project.displayName || project.name),
+    el("span", {class: "path"}, project.path),
+    sparkline(project.activityBuckets, project.runningCount ? "var(--blue)" : "var(--slate)")));
+
+  const grid = el("div", {class: "dgrid"});
+  const units = el("div", {class: "dpanel"}, el("h3", {}, `作業単位（${(project.units || []).length}）`));
+  for (const unit of project.units || []) {
+    const state = stateOf(unit);
+    const prog = unit.progress || {};
+    units.append(el("a", {class: "rowlink", href: unitHref(project, unit)},
+      el("div", {class: "unitline clickable st-" + state},
+        el("span", {class: "dot" + (state === "running" ? " pulse" : "")}),
+        el("span", {class: "label"}, unit.label || unit.unitId),
+        el("span", {class: "state"}, (STATE[state] || {}).label || state)),
+      el("div", {class: "unitsub"},
+        el("span", {}, unit.activity || ((unit.derived || {}).reasons || [])[0] || ""),
+        el("span", {}, "·"), agoNode(unit.lastHeartbeat),
+        prog.total ? el("span", {}, `· ${prog.done}/${prog.total - (prog.dropped || 0)}`) : null)));
+  }
+  if (!(project.units || []).length) units.append(el("div", {class: "empty"}, "記録された作業単位はありません"));
+  grid.append(units);
+
+  if ((project.priorityItems || []).length) {
+    const panel = el("div", {class: "dpanel"}, el("h3", {}, "要注意"));
+    for (const item of project.priorityItems) {
+      panel.append(el("div", {class: "unitsub", style: "margin-left:0"},
+        el("span", {}, (item.category === "human" ? "P0" : item.category === "incident" ? "P1" : "P2") + " " + item.title),
+        el("span", {}, "·"), el("span", {}, item.reason || "")));
+    }
+    grid.append(panel);
+  }
+  if ((project.resources || []).length) {
+    const panel = el("div", {class: "dpanel"}, el("h3", {}, "排他資源"));
+    for (const r of project.resources) {
+      const holder = r.holder || {};
+      panel.append(el("div", {class: "unitsub", style: "margin-left:0"},
+        el("span", {}, r.resource), el("span", {}, "→"),
+        el("span", {}, holder.label || holder.unitId || "?"),
+        r.source === "tool" ? el("span", {}, "（ツール）") : null,
+        r.holderAlive === false ? el("span", {style: "color:var(--red)"}, "保持者不在") : null));
+    }
+    grid.append(panel);
+  }
+  if ((project.devices || []).length) {
+    const panel = el("div", {class: "dpanel"}, el("h3", {}, "デバイス"));
+    for (const d of project.devices) {
+      panel.append(el("div", {class: "unitsub", style: "margin-left:0"},
+        el("span", {}, d.serial), el("span", {}, `load ${d.load1}`),
+        (d.ports || []).length ? el("span", {}, "ports " + d.ports.join(",")) : null,
+        d.warn ? el("span", {style: "color:var(--amber)"}, "過負荷") : null));
+    }
+    grid.append(panel);
+  }
+  if ((project.warnings || []).length) {
+    const panel = el("div", {class: "dpanel"}, el("h3", {}, "記録の警告"));
+    for (const w of project.warnings) panel.append(el("div", {class: "unitsub", style: "margin-left:0;color:var(--amber)"}, w));
+    grid.append(panel);
+  }
+  box.append(grid);
+}
+function drawDetail(fleet, target) {
+  const box = document.getElementById("detailView");
+  box.textContent = "";
+  const project = (fleet.projects || []).find(p => p.projectId === target.projectId);
+  if (!project) {
+    box.append(crumbs({text: "Fleet", href: "#/"}), el("div", {class: "empty"}, "このプロジェクトは記録に無い（削除されたか、別のホストの記録）"));
+    return;
+  }
+  if (target.view === "unit") {
+    const unit = (project.units || []).find(u => u.unitId === target.unitId);
+    if (!unit) {
+      box.append(crumbs({text: "Fleet", href: "#/"}, {text: project.displayName || project.name, href: projectHref(project)}),
+        el("div", {class: "empty"}, "この作業単位は記録に無い（完了分の保持上限を超えた可能性）"));
+      return;
+    }
+    drawUnitDetail(fleet, project, unit);
+    return;
+  }
+  drawProjectDetail(fleet, project);
+}
+
 function draw(fleet) {
   if (!fleet) return;
+  const target = route();
+  const fleetView = document.getElementById("fleetView");
+  const detailView = document.getElementById("detailView");
+  document.getElementById("host").textContent = (fleet.host || "") + " · local fleet";
+  drawStats(fleet);
+  drawFeed(fleet);
+  if (target.view !== "fleet") {
+    fleetView.hidden = true;
+    detailView.hidden = false;
+    drawDetail(fleet, target);
+    tickAges();
+    return;
+  }
+  fleetView.hidden = false;
+  detailView.hidden = true;
+  drawFleet(fleet);
+}
+
+function drawFleet(fleet) {
   const open = new Set(Array.from(document.querySelectorAll("details[open]"))
     .map(d => (d.closest("[data-project]") || {}).dataset?.project).filter(Boolean));
   const showDone = document.getElementById("showDone").checked;
   const projects = fleet.projects || [];
   const projectsById = {};
   for (const p of projects) projectsById[p.projectId] = p;
-
-  document.getElementById("host").textContent = (fleet.host || "") + " · local fleet";
-  drawStats(fleet);
-  drawFeed(fleet);
 
   // 一列サマリ: 全プロジェクトを 1 行で。稼働＝青、要注意＝赤/黄、待機＝灰
   const strip = document.getElementById("fleetStrip");
@@ -636,12 +926,13 @@ function draw(fleet) {
     const worst = (project.priorityItems || [])[0];
     const color = worst ? (worst.category === "watch" ? "amber" : "red")
                         : (project.runningCount ? "blue" : "slate");
-    strip.append(el("span", {class: "fchip", style: `--c: var(--${color}); --pc: var(${paletteVar(project)})`,
+    strip.append(el("a", {class: "rowlink", href: projectHref(project), style: "display:inline-block"},
+      el("span", {class: "fchip", style: `--c: var(--${color}); --pc: var(${paletteVar(project)})`,
                              title: `${project.displayName || project.name}: 稼働 ${project.runningCount || 0} / 要注意 ${project.attentionCount || 0}`},
-      el("span", {class: "dot" + (project.runningCount ? " pulse" : "")}),
-      el("span", {class: "pn"}, project.displayName || project.name),
-      el("span", {class: "n"}, `${project.runningCount || 0}▶`),
-      (project.attentionCount ? el("span", {class: "n"}, `${project.attentionCount}!`) : null)));
+        el("span", {class: "dot" + (project.runningCount ? " pulse" : "")}),
+        el("span", {class: "pn"}, project.displayName || project.name),
+        el("span", {class: "n"}, `${project.runningCount || 0}▶`),
+        (project.attentionCount ? el("span", {class: "n"}, `${project.attentionCount}!`) : null))));
   }
 
   const matrix = document.getElementById("matrix");
@@ -689,6 +980,8 @@ try {
   document.body.classList.toggle("tv", tvMode.checked);
 } catch (e) { /* 参照できない環境では既定のまま */ }
 applyTheme();
+// 戻る/進む・URL 直打ち・リンクのどれでも同じ経路で描き直す（ビューの状態は hash だけが持つ）
+window.addEventListener("hashchange", () => { window.scrollTo(0, 0); draw(current); });
 draw(current);
 setInterval(tickAges, 1000);
 if (location.protocol.startsWith("http")) {

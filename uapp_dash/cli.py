@@ -56,25 +56,32 @@ def _bump_event_count(store: StatusStore, unit: dict, kind: str, data: dict) -> 
     unit["eventCount"] = seq
 
 
-def ensure_gitignore(project_root: Path) -> bool:
+# 何をしたかを呼び手が言えるようにする（「追記したのか、元から在ったのか」が出力から分からず、
+# 導入した AI が確認のために .gitignore を開き直していた）
+GITIGNORE_ADDED = "added"
+GITIGNORE_PRESENT = "present"
+GITIGNORE_NO_REPO = "not-a-git-repo"
+
+
+def ensure_gitignore(project_root: Path) -> str:
     """`.agent-status/` を .gitignore へ追記する（git リポジトリのときだけ・重複追記しない）。"""
     if not (project_root / ".git").exists():
-        return False
+        return GITIGNORE_NO_REPO
     gitignore = project_root / ".gitignore"
     entry = f"{P.STATUS_DIR_NAME}/"
     if gitignore.exists():
         lines = [line.strip() for line in gitignore.read_text(encoding="utf-8", errors="replace").splitlines()]
         if entry in lines or P.STATUS_DIR_NAME in lines:
-            return False
+            return GITIGNORE_PRESENT
         text = gitignore.read_text(encoding="utf-8", errors="replace")
         prefix = "" if text.endswith("\n") or not text else "\n"
         with gitignore.open("a", encoding="utf-8", newline="\n") as fh:
             fh.write(f"{prefix}\n# エージェント開発ステータス（ホスト固有の一時状態）\n{entry}\n")
-        return True
+        return GITIGNORE_ADDED
     gitignore.write_text(
         f"# エージェント開発ステータス（ホスト固有の一時状態）\n{entry}\n", encoding="utf-8"
     )
-    return True
+    return GITIGNORE_ADDED
 
 
 # --- サブコマンド -------------------------------------------------------
@@ -106,10 +113,15 @@ def cmd_init(args) -> int:
     store = _store(args)
     store.ensure()
     project_root = store.project_root
-    added = ensure_gitignore(project_root)
+    gitignore = ensure_gitignore(project_root)
     print(f"作成: {store.root}")
-    if added:
+    # 「やらなかった」ことも言う（黙って何も出さないと、追記漏れなのか既存なのか分からない）
+    if gitignore == GITIGNORE_ADDED:
         print(f"追記: {project_root / '.gitignore'} に {P.STATUS_DIR_NAME}/")
+    elif gitignore == GITIGNORE_PRESENT:
+        print(f"確認: {project_root / '.gitignore'} には {P.STATUS_DIR_NAME}/ が既にある（追記なし）")
+    else:
+        print(f"対象外: git リポジトリではないので .gitignore は触らない（{project_root}）")
     aggregate.register_project(project_root)
     if args.agents:
         _install_agent_rules(project_root, args.agents, store.root)
@@ -178,6 +190,11 @@ def cmd_begin(args) -> int:
     store.write_unit(unit)
     aggregate.register_project(project_root)
     print(unit_id)
+    # 使い方は **stderr** に出す（stdout は unitId だけ。`$u = uapp-dash begin …` を壊さない）
+    print(f"以後のコマンドに --unit-id {unit_id} を付ける。"
+          "テスト/ビルドのラッパーからツール側の記録を撃つときも同じ値を渡すと確実に結びつく"
+          "（渡さない場合、このプロジェクトで進行中の単位が 1 件だけなら自動で結びつく）",
+          file=sys.stderr)
     return EXIT_OK
 
 
@@ -243,6 +260,28 @@ def cmd_blocked(args) -> int:
     _touch(unit)
     _bump_event_count(store, unit, "claim.blocked", dict(unit["blocked"]))
     store.write_unit(unit)
+    return EXIT_OK
+
+
+def cmd_ack(args) -> int:
+    """終了済みの失敗・中断を「人が確認した」と記録する。
+
+    確認するまで要注意欄に残り続けるのは正しい（見落とさないため）が、**外す手段が無い**と
+    終わった失敗が永久に居座り、本当に手を貸すべきものが埋もれる（実運用で発覚し、
+    掃除のために記録ファイルごと消す羽目になった）。
+    """
+    store = _store(args)
+    unit_id = _resolve_unit_id(args)
+    unit = _load_unit(store, unit_id)
+    if unit.get("state") not in P.TERMINAL_STATES:
+        raise SystemExit(f"確認済みにできるのは終了した単位だけ: {unit_id} は {unit.get('state')}"
+                         "（進行中の単位は end で閉じる）")
+    unit["acknowledgedAt"] = P.now_iso()
+    if args.note:
+        unit["acknowledgedNote"] = args.note
+    _bump_event_count(store, unit, "claim.ack", {"note": args.note} if args.note else {})
+    store.write_unit(unit)
+    print(f"確認済みにした: {unit_id}")
     return EXIT_OK
 
 
@@ -461,6 +500,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_end.add_argument("--summary")
     p_end.add_argument("--unit-id")
     p_end.set_defaults(func=cmd_end)
+
+    p_ack = sub.add_parser("ack", help="終了済みの失敗・中断を確認済みにする（要注意欄から外す）")
+    p_ack.add_argument("--unit-id")
+    p_ack.add_argument("--note", help="確認した内容（対応済み・既知の問題 等）")
+    p_ack.set_defaults(func=cmd_ack)
 
     p_res = sub.add_parser("resource", help="排他資源の取得/解放")
     p_res.add_argument("action", choices=["acquire", "release"])

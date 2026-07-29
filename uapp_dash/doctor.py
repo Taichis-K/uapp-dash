@@ -234,17 +234,87 @@ def _check_agent_rules(project_root: Path, status_dir: Path) -> list[dict]:
                            _agent_hint(project_root, "both", paths["codex"]))]
 
 
-def _check_emitter(project_root: Path) -> list[dict]:
-    # 導入先レイアウト（uapp_e2e\scripts\）と、キット開発リポのレイアウト（scripts\）の両方を見る。
-    # 前者だけ見ていると、キット自身のリポジトリで「該当なし」と誤って表示される
-    for relative in (Path("uapp_e2e") / "scripts" / "emit-status.ps1",
+EMITTER_HINT = ("ビルド・テスト・E2E のラッパーの末尾から "
+                "`uapp-dash-emit evidence.test --set passed=… --set failed=… --set exitCode=…` を呼ぶ"
+                "（`.agent-status` が無いプロジェクトでは完全な no-op なので、他所へ影響しない）")
+
+
+def _tool_evidence(store: StatusStore) -> tuple[dict | None, int]:
+    """**実際に記録された** `producer: "tool"` のイベントを探す。
+
+    配線の形（キット同梱・自前ラッパー・CI）を問わずに判定するため、特定パスの
+    ファイル探しはしない。ファイルの存在で判定していた頃は、自前ラッパーから
+    正しく記録できている環境が「配線なし」と表示されていた。
+    """
+    if not store.exists():
+        return None, 0
+    unit_ids = [unit.get("unitId") for unit in store.list_units(include_done=True)]
+    unit_ids += store.orphan_journals()
+    latest, count = None, 0
+    for unit_id in unit_ids:
+        if not unit_id:
+            continue
+        for event in store.read_events(unit_id):
+            if event.get("producer") != P.PRODUCER_TOOL:
+                continue
+            count += 1
+            if latest is None or str(event.get("at") or "") > str(latest.get("at") or ""):
+                latest = event
+    return latest, count
+
+
+def _kit_present(project_root: Path) -> Path | None:
+    """uapp_e2e キットの導入痕跡。導入先レイアウトとキット開発リポの両方を見る。"""
+    for relative in (Path("uapp_e2e"), Path("Assets") / "uapp_e2e",
+                     Path("uapp_e2e") / "scripts" / "emit-status.ps1",
                      Path("scripts") / "emit-status.ps1"):
-        emitter = project_root / relative
-        if emitter.exists():
-            return [_check(OK, "ツール側エミッタの配線（uapp_e2e キット）", str(emitter))]
-    return [_check(INFO, "ツール側エミッタの配線（uapp_e2e キット）",
-                   "このプロジェクトに uapp_e2e キットは無い（該当なし）",
-                   "自前のラッパーから記録するなら `uapp-dash-emit evidence.test --set passed=… --set exitCode=…`")]
+        candidate = project_root / relative
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _check_evidence_binding(store: StatusStore) -> list[dict]:
+    """**進行中の単位に客観エビデンスが 1 件も無い**状態を炙り出す。
+
+    ラッパーが別プロセスで動くと unitId が届かず、記録は ambient に落ちる。
+    記録自体は残るので「配線は [済]」に見えるが、単位レベルで申告と実測を
+    突き合わせられない（二層化の目的が成立しない）。繋がっていないと気づけること自体に価値がある。
+    """
+    active = [unit for unit in store.list_units(include_done=False)
+              if unit.get("unitId") and unit.get("state") not in P.TERMINAL_STATES]
+    if len(active) != 1:
+        return []                      # 0 件は対象外、2 件以上は ambient が正しい挙動
+    unit = active[0]
+    # **成果のエビデンスだけを数える**。デバイス負荷や資源取得の記録は配線の証明にはなるが、
+    # 「この単位で何を作って何が通ったか」の証明にはならない（device 1 件で警告が消えると、
+    # テストを一度も走らせていない単位が緑に見える）
+    outcome_kinds = ("evidence.test", "evidence.e2e", "evidence.build", "evidence.git")
+    has_outcome = any(event.get("producer") == P.PRODUCER_TOOL and event.get("kind") in outcome_kinds
+                      for event in store.read_events(unit["unitId"]))
+    if has_outcome:
+        return []
+    return [_check(INFO, "進行中の単位にツールの記録が結びついている",
+                   f"{unit['unitId']}（{unit.get('label') or ''}）にはまだ客観エビデンスが無い",
+                   "テスト/ビルドのラッパーから `uapp-dash-emit … --unit-id "
+                   f"{unit['unitId']}` を撃つ。渡せない場合でも、進行中の単位が 1 件だけなら自動で結びつく")]
+
+
+def _check_emitter(project_root: Path, store: StatusStore) -> list[dict]:
+    """ツール側の配線は**実績で判定する**（キットの有無と配線の有無は別物）。"""
+    latest, count = _tool_evidence(store)
+    if latest is not None:
+        checks = [_check(OK, "ツール側エミッタの配線（客観エビデンス）",
+                         f"{count} 件記録済み・直近 {latest.get('kind')} {latest.get('at')}")]
+        checks += _check_evidence_binding(store)
+        return checks
+    kit = _kit_present(project_root)
+    if kit:
+        return [_check(NG, "ツール側エミッタの配線（客観エビデンス）",
+                       f"uapp_e2e キットはあるが記録が 1 件も無い（{kit}）",
+                       "キット v0.1.4 以降の `scripts/emit-status.ps1` を使うか、" + EMITTER_HINT)]
+    return [_check(INFO, "ツール側エミッタの配線（客観エビデンス）",
+                   "ツールからの記録がまだ無い（自前で配線する）", EMITTER_HINT)]
 
 
 def _check_records(store: StatusStore) -> list[dict]:
@@ -268,7 +338,7 @@ def run_checks(project: Path | None = None) -> list[dict]:
     checks += _check_gitignore(project_root)
     checks += _check_registry(project_root)
     checks += _check_agent_rules(project_root, store.root)
-    checks += _check_emitter(project_root)
+    checks += _check_emitter(project_root, store)
     checks += _check_records(store)
     return checks
 

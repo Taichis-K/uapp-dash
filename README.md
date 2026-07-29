@@ -40,6 +40,9 @@ python -m uapp_dash view --out fleet.html        # 1 ファイルで完結する
 python -m uapp_dash view --serve --open          # 5 秒ごとに更新される表示
 ```
 
+`--project` は**サブコマンドの前後どちらでもよい**（`uapp-dash --project <path> init` ＝
+`uapp-dash init --project <path>`。`uapp-dash-emit` も同じ）。
+
 `pip install -e .` すると **`uapp-dash` / `uapp-dash-emit`** コマンドとして使える。
 短い `dash` は別名としても置かない — **Debian 系の POSIX シェル `/usr/bin/dash` と衝突**し
 （別環境の AI が `dash begin` でシェルを起動して失敗した実績がある）、名前が一般的すぎて
