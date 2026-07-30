@@ -25,12 +25,14 @@ python -m uapp_dash --project <projectRoot> doctor
 # エージェント側（自己申告）。begin の出力が unitId で、以後のコマンドに毎回渡す
 # （AI のコマンド実行は 1 回ごとに別プロセスになることが多く、環境変数 UAPP_DASH_UNIT_ID は
 #  同じシェルの中でしか効かない＝開始だけ成功して以降が全部失敗する）
-python -m uapp_dash begin --label "issue #12 の実装" --tasks "設計;実装;テスト" --claims "Assets/Scenes/Main.unity"
+# --claims は値ごとに分ける（空白区切り。";" 区切りは --tasks だけ。混同したら警告が出る）
+python -m uapp_dash begin --label "issue #12 の実装" --tasks "設計;実装;テスト" `
+    --claims "Assets/Scenes/Main.unity" "Assets/Scripts/**"
 python -m uapp_dash heartbeat --unit-id <unitId> --activity "ビルド中" --ttl 2400
 python -m uapp_dash task t1 --done --unit-id <unitId>
 python -m uapp_dash blocked --unit-id <unitId> --reason "push の承認待ち" --needs approval
 python -m uapp_dash end --unit-id <unitId> --result success --summary "テストまで通過"
-python -m uapp_dash units                      # unitId を忘れたとき（--all で完了分も）
+python -m uapp_dash units                      # unitId を忘れたとき（残り TTL も出る。--all で完了分も）
 
 # ツール側（客観エビデンス。ラッパーから呼ぶ。.agent-status が無ければ何もしない）
 python -m uapp_dash.emit evidence.test --set suite=unity-editmode --set passed=12 --set failed=0 --set exitCode=0
@@ -96,7 +98,11 @@ cloudflared tunnel --url http://127.0.0.1:8788
 - **単位ごとにファイルを分ける**: 1 プロジェクトに複数の開発単位が同時に居るため、共有ファイルへの
   read-modify-write を避ける。書き手は自分のスナップショットを原子的に置換し、ジャーナルには追記だけする
 - **停滞は TTL で判定する**: 長いビルド（20 分超）を停滞と誤判定しないよう、書き手が `ttlSec` を宣言する。
-  `stalled` / `crashed` はダッシュボードだけが付ける（自己申告できる停滞は停滞ではない）
+  `stalled` / `crashed` はダッシュボードだけが付ける（自己申告できる停滞は停滞ではない）。
+  **期限の判定は 1 か所に集約**してあり（表示・停滞判定・エビデンスの自動結びつけが同じ結論になる）、
+  `units` は残り TTL と期限切れを出す（`state: running` と期限切れは両立するため）
+- **申告に数字を書かせない**: `end --summary` / `heartbeat --activity` にテスト件数らしき数字があると
+  警告する（止めない）。自己申告と客観エビデンスを分けている意味は、食い違いを人に見せることにある
 - **人待ちの状態は停滞にしない**: `blocked` / `waiting-approval` / `review` は止まっているのが正常
 - **claims は勧告のみ**: 編集領域の重なりを警告するだけでブロックしない。シーン・プレハブ・アセット
   （マージ困難な YAML）はファイル丸ごと排他へ自動昇格し、`.meta` も同伴する
@@ -117,6 +123,11 @@ python -m pytest tests/test_installed_smoke.py -q  # 導入検証用の最小ス
 `pip install -e ".[test]"` した仮想環境で実行すること。**未インストールならスキップではなく失敗する**
 （スキップだと終了コードが 0 になり、自動チェックが「入った」と誤認するため）。
 
-## ライセンス
+## ライセンスと商標
 
-MIT
+MIT（同梱の `LICENSE`）。実行時の外部依存はゼロで、第三者のコード・フォント・ライブラリを
+同梱していない（ビューアーも自己完結 HTML）。
+
+Unity は Unity Technologies の商標。**このツールは Unity Technologies 公式の製品ではなく、
+提携・承認も受けていない**。監視対象のプロジェクトやそこで使うツールには、それぞれの提供元の
+ライセンス・利用規約が適用される。

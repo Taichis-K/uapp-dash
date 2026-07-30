@@ -16,7 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, agents as agents_mod, aggregate, protocol as P
+from . import (__version__, agents as agents_mod, aggregate, attention,
+               claims as claims_mod, protocol as P)
 from .store import StatusStore
 
 OK = "ok"
@@ -294,10 +295,86 @@ def _check_evidence_binding(store: StatusStore) -> list[dict]:
                       for event in store.read_events(unit["unitId"]))
     if has_outcome:
         return []
+    # **「まだ記録が無い」だけでは原因が分からない**。自動結びつけは「ハートビートが切れて
+    # いない単位だけ」という条件で働くので、TTL 切れならそれが理由だと言い切る
+    # （運用では TTL 切れに気づけず、記録が ambient に落ち続けた）
+    window = attention.heartbeat_window(unit)
+    if window["overdue"]:
+        return [_check(NG, "進行中の単位にツールの記録が結びついている",
+                       f"{unit['unitId']}（{unit.get('label') or ''}）は **TTL 切れ**"
+                       f"（{-window['remainingSec']}秒超過）。この状態ではツールの記録は"
+                       "自動で結びつかず ambient に落ちる",
+                       f"`uapp-dash heartbeat --unit-id {unit['unitId']} --ttl <秒>` で伸ばす"
+                       "（長時間処理の直前に伸ばす。Android ビルド 2400 / Unity テスト 900 が目安）")]
     return [_check(INFO, "進行中の単位にツールの記録が結びついている",
-                   f"{unit['unitId']}（{unit.get('label') or ''}）にはまだ客観エビデンスが無い",
+                   f"{unit['unitId']}（{unit.get('label') or ''}）にはまだ客観エビデンスが無い"
+                   f"（TTL 残り {window['remainingSec']}秒）",
                    "テスト/ビルドのラッパーから `uapp-dash-emit … --unit-id "
                    f"{unit['unitId']}` を撃つ。渡せない場合でも、進行中の単位が 1 件だけなら自動で結びつく")]
+
+
+def _check_claim_targets(store: StatusStore) -> list[dict]:
+    """claims の**書き方の事故**を拾う。
+
+    claims は「重なりを警告する」ための情報なので、壊れていても何も起きない
+    （警告が出ないだけ）＝**動いていないことに気づく手段が無い**。区切りの取り違え
+    （`;` 連結）で衝突検出が静かに無効化されていた実例があるため、気づく道を用意する。
+
+    **どちらも `info`（終了コードを汚さない）**。人が読んで判断できる材料を出すのが目的で、
+    機械的に「誤り」と断定できないため:
+
+    - `;` を含む claim は取り違えの可能性が高いが、**`;` はファイル名に使える文字**なので
+      （`\\;` とエスケープして意図的に宣言できる）誤りと断定できない
+    - 存在しない領域の宣言も**正常**（「編集する前に宣言する」のが規約なので、
+      これから作るファイル・ディレクトリを宣言する）。衝突判定はパターン同士の比較で、
+      ファイルの実在に依存しない＝実在しなくても検出は働く
+
+    ファイルシステムの全走査はしない（大きな Unity プロジェクトで重い）。
+    グロブの**ワイルドカードより前の部分**が実在するかだけを見る。
+    """
+    if not store.exists():
+        return []
+    project_root = store.project_root
+    separators: list[str] = []
+    missing: list[str] = []
+    checked = 0
+    for unit in store.list_units(include_done=False):
+        if unit.get("state") in P.TERMINAL_STATES:
+            continue
+        for claim in unit.get("claims") or []:
+            path = claim.get("path") or ""
+            if not path:
+                continue
+            if claims_mod.SEPARATOR in path:
+                separators.append(f"{unit.get('unitId')}: {path}")
+                continue
+            prefix = claims_mod.static_prefix(path).rstrip("/")
+            if not prefix:
+                continue          # 先頭からワイルドカード（**/*.cs 等）は判定できない
+            checked += 1
+            if not (project_root / prefix).exists():
+                missing.append(f"{unit.get('unitId')}: {path}")
+    checks: list[dict] = []
+    if separators:
+        checks.append(_check(INFO, "claims の区切り",
+                             "`;` を含む claim がある（1 本のパスとして登録されている）: "
+                             + _sample(separators),
+                             "区切りの取り違えなら宣言し直す（`--claims` は空白区切り。"
+                             "`;` 区切りは `--tasks` だけ）。`\\;` でエスケープして"
+                             "意図的に宣言したパスなら、このままで正しい"))
+    if missing:
+        checks.append(_check(INFO, "claims が指す領域の実在",
+                             "まだ存在しない領域を宣言している: " + _sample(missing),
+                             "これから作るなら正常（衝突判定はパターン比較なので実在に依存しない）。"
+                             "心当たりが無ければタイポを疑う"))
+    elif checked:
+        checks.append(_check(OK, "claims が指す領域の実在", f"{checked} 件を確認"))
+    return checks
+
+
+def _sample(items: list[str], limit: int = 5) -> str:
+    head = " / ".join(items[:limit])
+    return head if len(items) <= limit else f"{head} ほか{len(items) - limit}件"
 
 
 def _check_emitter(project_root: Path, store: StatusStore) -> list[dict]:
@@ -339,6 +416,7 @@ def run_checks(project: Path | None = None) -> list[dict]:
     checks += _check_registry(project_root)
     checks += _check_agent_rules(project_root, store.root)
     checks += _check_emitter(project_root, store)
+    checks += _check_claim_targets(store)
     checks += _check_records(store)
     return checks
 

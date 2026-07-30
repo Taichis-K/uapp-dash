@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, protocol as P
+from . import __version__, attention, protocol as P
 from .proc import hostname
 from .store import StatusStore
 
@@ -23,9 +23,17 @@ SOURCE_EXPLICIT = "explicit"
 SOURCE_ENV = "env"
 SOURCE_ACTIVE = "active-unit"
 SOURCE_AMBIENT = "ambient"
+# ambient に落ちた理由が「進行中の単位が TTL 切れだった」場合。後から
+# 「なぜこの記録は単位に付かなかったのか」を辿れるようにする（気づけないのが実害だった）
+SOURCE_AMBIENT_OVERDUE = "ambient-unit-overdue"
 
 
 def sole_active_unit(store: StatusStore | None) -> str | None:
+    """後方互換の薄いラッパー（unitId だけ返す）。"""
+    return sole_active_unit_with_reason(store)[0]
+
+
+def sole_active_unit_with_reason(store: StatusStore | None) -> tuple[str | None, str | None]:
     """進行中の単位が**ちょうど 1 件**ならその unitId。それ以外は None。
 
     ラッパー（run-e2e.ps1 / verify.ps1 等）は AI から別プロセスで起動されるため、
@@ -42,10 +50,10 @@ def sole_active_unit(store: StatusStore | None) -> str | None:
     - 該当が 0 件（誰の作業でもない）／2 件以上（どちらか決められない）なら ambient のまま
     """
     if store is None or not store.exists():
-        return None
+        return None, None
     here = hostname()
-    now = P.now()
     found: list[str] = []
+    overdue: list[str] = []
     for unit in store.list_units(include_done=False):
         unit_id = unit.get("unitId")
         if not unit_id or unit.get("state") in P.TERMINAL_STATES:
@@ -53,13 +61,19 @@ def sole_active_unit(store: StatusStore | None) -> str | None:
         owner_host = (unit.get("owner") or {}).get("host")
         if owner_host and owner_host != here:
             continue                       # 別マシンの作業に付けない
-        heartbeat, _ = P.parse_iso_safe(unit.get("lastHeartbeat") or unit.get("startedAt"))
-        if heartbeat is not None and now > P.overdue_after(heartbeat, int(unit.get("ttlSec") or 0)):
-            continue                       # 停滞している単位には付けない
+        # **期限の判定は attention.heartbeat_window に一本化する**（表示と食い違わせない。
+        # 時刻が読めない単位も「新鮮だと証明できない」ので候補から外れる）
+        if attention.heartbeat_window(unit)["overdue"]:
+            overdue.append(unit_id)        # 停滞している単位には付けない
+            continue
         found.append(unit_id)
         if len(found) > 1:
-            return None                    # 2 件見つかった時点で決められない（走査も打ち切る）
-    return found[0] if found else None
+            return None, None              # 2 件見つかった時点で決められない（走査も打ち切る）
+    if found:
+        return found[0], None
+    # **なぜ結びつかなかったのか**を呼び手が記録できるようにする。TTL 切れの単位が
+    # ちょうど 1 件なら、それが原因だと後から突き合わせられる（気づけないのが実害だった）
+    return None, "unit-overdue" if len(overdue) == 1 else None
 
 
 def resolve_unit_id(explicit: str | None = None, env: dict | None = None,
@@ -78,10 +92,12 @@ def resolve_unit_id_with_source(explicit: str | None = None, env: dict | None = 
         candidate = env.get(key)
         if candidate and P.valid_unit_id(candidate):
             return candidate, SOURCE_ENV
-    active = sole_active_unit(store)
+    active, reason = sole_active_unit_with_reason(store)
     if active:
         return active, SOURCE_ACTIVE
     # 誰の作業か分からなくても、プロジェクト単位では見えるようにする
+    if reason == "unit-overdue":
+        return f"{AMBIENT_PREFIX}{hostname()}", SOURCE_AMBIENT_OVERDUE
     return f"{AMBIENT_PREFIX}{hostname()}", SOURCE_AMBIENT
 
 
@@ -138,9 +154,10 @@ def emit(kind: str, data: dict, *, project: Path | None = None, unit_id: str | N
     store.ensure()
 
     unit_id, source = resolve_unit_id_with_source(unit_id, store=store)
-    if source == SOURCE_ACTIVE:
-        # 自動で結びつけたことを記録に残す（後から「なぜこの単位に入ったのか」を辿れるように）
-        data = {**(data or {}), "unitIdSource": SOURCE_ACTIVE}
+    if source in (SOURCE_ACTIVE, SOURCE_AMBIENT_OVERDUE):
+        # 自動で結びつけた／結びつけられなかった理由を記録に残す
+        # （後から「なぜこの単位に入ったのか / 入らなかったのか」を辿れるように）
+        data = {**(data or {}), "unitIdSource": source}
     # seq は採番しない（0＝不明）。並行追記では通し番号を保証できず、読み手も順序に依存しない
     return store.append_event(unit_id, kind, data, P.PRODUCER_TOOL, seq=0)
 

@@ -102,12 +102,83 @@ def _in_implicit_exclusive(path: str) -> bool:
     return any(patterns_overlap(path, pattern) for pattern in IMPLICIT_EXCLUSIVE)
 
 
+SEPARATOR = ";"
+
+
+def _split_unescaped(text: str) -> list[str]:
+    """エスケープされていない `;` で分割し、`\\;` はリテラルの `;` に戻す。"""
+    parts: list[str] = []
+    buffer: list[str] = []
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch == "\\" and index + 1 < len(text) and text[index + 1] == SEPARATOR:
+            buffer.append(SEPARATOR)     # `\;` はリテラル
+            index += 2
+            continue
+        if ch == SEPARATOR:
+            parts.append("".join(buffer))
+            buffer = []
+            index += 1
+            continue
+        buffer.append(ch)
+        index += 1
+    parts.append("".join(buffer))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def split_separators(raw) -> tuple[list, list[str]]:
+    """**CLI 入力専用**: `;` で連結された値をほどく。戻り値は (ほどいた値, ほどいた元の値)。
+
+    **隣り合うオプションで区切りが違うのが事故のもと**だった。`--tasks` は `;` 区切り、
+    `--claims` は空白区切りなので、`--tasks "調査;実装"` を書いた直後に
+    `--claims "a/**;b/**"` と書くのが自然に起きる。しかも間違えても
+    「`;` を含む 1 本のパス」が claim になるだけで、**衝突検出が静かに無効化される**
+    （導入先で 2 回とも間違えており、記録を見るまで気づけなかった）。
+
+    ただし **`;` はファイル名に使える文字**（Windows でも POSIX でも不正ではない）なので、
+    ここで勝手にほどくのは「取り違えのほうが桁違いに起きやすい」という運用判断にすぎない。
+    そのため:
+
+    - **CLI の入口でだけ呼ぶ**（`normalize_claims` は純粋に保つ。保存済みデータや
+      ライブラリ利用者の宣言を、読み込むたびに黙って書き換えてはならない）
+    - **`\\;` はリテラルの `;`** として扱う（本当に `;` を含むパスの逃げ道）
+    - ほどいた事実は呼び手が警告できるよう返す（黙って直すと次も同じ書き方をする）
+    """
+    if not raw:
+        return [], []
+    if isinstance(raw, (str, dict)):
+        raw = [raw]
+    expanded: list = []
+    offenders: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            path, wrap = item, None
+        elif isinstance(item, dict):
+            path, wrap = str(item.get("path", "")), item
+        else:
+            expanded.append(item)
+            continue
+        if SEPARATOR not in path:
+            expanded.append(item)
+            continue
+        parts = _split_unescaped(path)
+        if len(parts) > 1:
+            offenders.append(path)
+        for part in parts:
+            expanded.append(part if wrap is None else {**wrap, "path": part})
+    return expanded, offenders
+
+
 def normalize_claims(raw) -> list[dict]:
     """文字列/辞書の混在を正規化し、Unity 固有の昇格規則を適用する。"""
     if not raw:
         return []
     if isinstance(raw, (str, dict)):
         raw = [raw]
+    # **ここでは `;` をほどかない**（`;` は正当なファイル名文字。保存済みの宣言を
+    # 読み込むたびに書き換えると、宣言した領域が黙って別物になる）。
+    # 区切りの取り違えをほどくのは CLI の入口だけ（split_separators）
     result: list[dict] = []
     seen: set[str] = set()
 

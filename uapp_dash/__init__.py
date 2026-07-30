@@ -3,6 +3,6 @@
 プロトコルの正本は docs/protocol-v0.md。
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 from . import protocol  # noqa: F401

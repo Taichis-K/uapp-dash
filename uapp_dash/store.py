@@ -123,16 +123,25 @@ def write_json_atomic(path: Path, payload: dict) -> None:
 
 
 def read_json(path: Path, retries: int = 1) -> dict | None:
-    """壊れた JSON（書き込み途中の読み取り）は一度だけ待って再試行する。"""
+    """壊れた JSON（書き込み途中の読み取り）は一度だけ待って再試行する。
+
+    **`ValueError` を丸ごと捕まえる**（`JSONDecodeError` はその一種）。JSON の構文としては
+    正しくても `json.loads` が落ちる入力がある（Python 3.11+ は 4300 桁を超える整数リテラルを
+    `ValueError` で拒否する）。1 ファイルで集約全体を止めないため、読めない記録は黙って捨てる。
+    """
     for attempt in range(retries + 1):
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        except (ValueError, UnicodeDecodeError, OSError):
             if attempt >= retries:
                 return None
             time.sleep(0.05)
+            continue
+        # **オブジェクト以外は壊れた記録として捨てる**（`[1]` や `"x"` を返すと、
+        # 呼び手の `.get(...)` が AttributeError になって集約全体が終わる）
+        return payload if isinstance(payload, dict) else None
     return None
 
 
@@ -359,9 +368,11 @@ class StatusStore:
                 continue  # 退避のやり直し等で同じ行が二重に入っても 1 件として扱う
             seen.add(line)
             try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue  # 追記途中の欠けた行は捨てる（読み手は止めない）
+                event = json.loads(line)
+            except ValueError:
+                continue  # 追記途中の欠けた行・json.loads が拒否する値は捨てる（読み手は止めない）
+            if isinstance(event, dict):
+                events.append(event)   # オブジェクト以外はイベントではない（読み手が .get で落ちる）
         # 追記マージで前後が入れ替わることがあるため、時刻で並べ直す（同時刻は元の行順）
         events.sort(key=lambda e: str(e.get("at") or ""))
         return events

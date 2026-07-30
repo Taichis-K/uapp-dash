@@ -78,6 +78,9 @@ PRODUCER_TOOL = "tool"
 
 DEFAULT_TTL_SEC = 300
 STALL_GRACE_SEC = 60
+# TTL の上限（30 日）。これ以上は「事実上無期限」であり、丸めても運用上の意味は変わらない。
+# 上限を設けるのは、桁の大きい値をそのまま timedelta に渡すと読み手が例外で落ちるため
+MAX_TTL_SEC = 86_400 * 30
 
 # 排他資源 ID の接頭辞（実際に衝突した資源だけ。増やさない）
 RESOURCE_PREFIXES = ("editor-play", "build", "device", "host-port")
@@ -180,5 +183,57 @@ def summarize_evidence(kind: str, data: dict) -> str:
     return kind
 
 
+def seconds_until_overdue(last_heartbeat: datetime, ttl_sec: int, now: datetime,
+                          grace: int = STALL_GRACE_SEC) -> int:
+    """期限までの残り秒（マイナスなら超過）。**日時への加算を避ける**のが要点。
+
+    `lastHeartbeat` は外部が書く値で、`9999-12-31T23:59:59+00:00` のような極端な日時でも
+    ISO として正しく読める。それに TTL を足すと `datetime` の上限を超えて `OverflowError` になり、
+    **1 単位で集約全体（view / units / 自動結びつけ）が死ぬ**。経過時間の側で比べれば、
+    どんな日時でも計算できる。
+    """
+    elapsed = (now - last_heartbeat).total_seconds()
+    return int(int(ttl_sec) + int(grace) - elapsed)
+
+
 def overdue_after(last_heartbeat: datetime, ttl_sec: int, grace: int = STALL_GRACE_SEC) -> datetime:
-    return last_heartbeat + timedelta(seconds=int(ttl_sec) + int(grace))
+    """期限の時刻。**極端な日時では飽和させる**（呼び手を例外で落とさない）。
+
+    残り秒の判定には `seconds_until_overdue` を使うこと。こちらは表示用。
+    """
+    try:
+        return last_heartbeat + timedelta(seconds=int(ttl_sec) + int(grace))
+    except (OverflowError, ValueError):
+        return datetime.max.replace(tzinfo=last_heartbeat.tzinfo)
+
+
+def ttl_of(unit: dict) -> int:
+    """単位の TTL（秒）。**欠損・0・負数・非数はすべて既定値**、巨大値は上限で丸める。
+
+    読み手（表示・停滞判定・エミッタの自動結びつけ）は必ずここを通す。別々に正規化すると、
+    同じ単位が「TTL 残り 240 秒」なのに「停滞」かつ「エビデンスは ambient」になる
+    （実際に食い違った）。`0` を「即座に期限切れ」と読まないのは、ジャーナルから合成した単位や
+    TTL を書かない書き手の記録が一斉に切れた扱いになるため。
+
+    **上限で丸めるのは読み手を落とさないため**。`ttlSec` は外部が書く値で、`--ttl` も
+    任意精度の整数を受け取る。桁の大きい値をそのまま `timedelta` に渡すと `OverflowError` になり、
+    **たった 1 単位で `view` / `units` の集約全体と自動結びつけが死ぬ**
+    （「読み手は壊れた記録で止まらない」という v0 の約束に反する）。
+    """
+    value = unit.get("ttlSec")
+    if isinstance(value, bool):
+        return DEFAULT_TTL_SEC
+    number = None
+    if isinstance(value, (int, float)):
+        try:
+            number = int(value)          # inf は OverflowError、nan は ValueError
+        except (OverflowError, ValueError):
+            number = None
+    elif isinstance(value, str):
+        try:
+            number = int(value.strip())  # 全角数字や "²" は ValueError（isdigit は真になる）
+        except ValueError:
+            number = None
+    if number is None or number <= 0:
+        return DEFAULT_TTL_SEC
+    return min(number, MAX_TTL_SEC)

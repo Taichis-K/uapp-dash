@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
-from . import (__version__, agents as agents_mod, aggregate, claims as claims_mod,
+from . import (__version__, agents as agents_mod, aggregate, attention, claims as claims_mod,
                doctor as doctor_mod, protocol as P, render)
 from .store import RELEASE_BUSY, RELEASE_NOT_OWNER, RELEASE_SETTLED, StatusStore, default_owner
 
@@ -43,10 +44,23 @@ def _load_unit(store: StatusStore, unit_id: str) -> dict:
     return unit
 
 
+def _normalize_ttl(raw) -> int:
+    """`--ttl` を**読み手と同じ規則**へ正規化して保存する（保存値と表示をズラさない）。
+
+    書いた値をそのまま入れると、桁の大きい `--ttl` が読み手側で丸められて
+    「宣言した TTL と表示される TTL が違う」ことになる。ここで揃えて、丸めたことも伝える。
+    """
+    ttl = P.ttl_of({"ttlSec": raw})
+    if raw is not None and raw != ttl:
+        print(f"--ttl {raw} は {ttl} 秒として扱います"
+              f"（0 以下・非数は既定 {P.DEFAULT_TTL_SEC} 秒 / 上限 {P.MAX_TTL_SEC} 秒）", file=sys.stderr)
+    return ttl
+
+
 def _touch(unit: dict, *, ttl: int | None = None) -> dict:
     unit["lastHeartbeat"] = P.now_iso()
     if ttl is not None:
-        unit["ttlSec"] = int(ttl)
+        unit["ttlSec"] = _normalize_ttl(ttl)
     return unit
 
 
@@ -138,6 +152,42 @@ def cmd_doctor(args) -> int:
     return EXIT_OK if not any(c["status"] == doctor_mod.NG for c in checks) else 1
 
 
+# 申告に「自分で書いたテスト件数」が混ざるのを見つける正規表現。
+# 二層化（自己申告とツールのエビデンスを分ける）の前提は、申告側に数字が無いこと。
+# 申告に数字があると、エビデンスと食い違っていても人が申告を読んで納得してしまう。
+# **止めない**（作業を邪魔しない）が、1 行警告するだけで抑止になる（導入先の AI が
+# 「規約を承知していたのに --summary に件数を書いた」と自己報告した）
+_SELF_REPORTED_NUMBERS = re.compile(
+    # 39/39・15 / 15（日付 2026/07/30 と issue 番号 #20/#21 は拾わない）
+    r"(?<![\d/.#])(?!\d{4}\s*/)\d{1,4}\s*/\s*\d{1,4}(?![\d/.])"
+    r"|\d+\s*(?:passed|failed|tests?\b)"                 # 39 passed・2 failed
+    r"|(?:passed|failed)\s*[:=]\s*\d+"
+    r"|\d+\s*件?\s*(?:通過|パス|成功|失敗)"                # 15 件通過・8 通過
+    r"|(?:EditMode|PlayMode|E2E|pytest)\s*\d+",          # EditMode 39 / PlayMode 19
+    re.IGNORECASE,
+)
+
+
+def warn_self_reported_numbers(text: str | None, field: str) -> bool:
+    """申告テキストにテスト件数らしき数字があれば警告する（真偽を返すのはテスト用）。"""
+    if not text or not _SELF_REPORTED_NUMBERS.search(text):
+        return False
+    print(f"規約に反しています: {field} にテスト件数らしき数字があります"
+          "（数字はツール側のエミッタが書きます。申告には「何をやり遂げたか」だけを書く）",
+          file=sys.stderr)
+    return True
+
+
+def _warn_claim_separators(offenders: list[str]) -> None:
+    """`;` 区切りで書かれた claims を「ほどいた」ことを知らせる（黙って直さない）。"""
+    if not offenders:
+        return
+    print(f"--claims は空白区切りです（`;` 区切りは --tasks だけ）。"
+          f"`;` を含む値をほどいて登録しました: {', '.join(offenders)}。"
+          '正しくは --claims "a/**" "b/**" のように値ごとに分ける'
+          "（本当に `;` を含むパスなら `\\;` とエスケープする）", file=sys.stderr)
+
+
 def _parse_tasks(spec: str | None) -> list[dict]:
     if not spec:
         return []
@@ -162,6 +212,7 @@ def cmd_begin(args) -> int:
     if not P.valid_unit_id(unit_id):
         raise SystemExit(f"不正な単位 ID: {unit_id!r}")
     owner = default_owner(agent=args.agent, session=args.session, unit_id=unit_id, pid=args.pid)
+    claim_values, claim_offenders = claims_mod.split_separators(args.claims or [])
     unit = {
         "schema": P.SCHEMA_UNIT,
         "unitId": unit_id,
@@ -172,9 +223,9 @@ def cmd_begin(args) -> int:
         "activity": args.activity or "",
         "startedAt": P.now_iso(),
         "lastHeartbeat": P.now_iso(),
-        "ttlSec": int(args.ttl),
+        "ttlSec": _normalize_ttl(args.ttl),
         "tasks": _parse_tasks(args.tasks),
-        "claims": claims_mod.normalize_claims(args.claims or []),
+        "claims": claims_mod.normalize_claims(claim_values),
         "resources": [],
         "lastEvidence": None,
         "eventCount": 0,
@@ -189,6 +240,8 @@ def cmd_begin(args) -> int:
     )
     store.write_unit(unit)
     aggregate.register_project(project_root)
+    _warn_claim_separators(claim_offenders)
+    warn_self_reported_numbers(args.activity, "--activity")
     print(unit_id)
     # 使い方は **stderr** に出す（stdout は unitId だけ。`$u = uapp-dash begin …` を壊さない）
     print(f"以後のコマンドに --unit-id {unit_id} を付ける。"
@@ -216,6 +269,7 @@ def cmd_heartbeat(args) -> int:
     if args.activity is not None:
         changed = changed or unit.get("activity") != args.activity
         unit["activity"] = args.activity
+        warn_self_reported_numbers(args.activity, "--activity")
     _touch(unit, ttl=args.ttl)
     # 状態も作業内容も変わらないハートビートはジャーナルに書かない（肥大化防止）
     if changed:
@@ -291,6 +345,7 @@ def cmd_end(args) -> int:
     unit = _load_unit(store, unit_id)
     if args.result not in P.RESULTS:
         raise SystemExit(f"--result は {P.RESULTS} のいずれか")
+    warn_self_reported_numbers(args.summary, "--summary")
     # 掴んだままの排他資源を解放してから終わる（取り残しロックを作らない）。
     # 「今は触れない（busy）」だけを未解決として残す。「記録が無い」「別の単位が取り直した」は
     # もう自分のものではないので、いつまでも抱えない（end が永久に成功しなくなる）
@@ -416,7 +471,11 @@ def cmd_units(args) -> int:
     if args.json:
         print(json.dumps([{k: u.get(k) for k in ("unitId", "label", "state", "activity", "owner",
                                                  "startedAt", "lastHeartbeat", "claims", "resources")}
-                          | {"derivedState": (u.get("derived") or {}).get("state")} for u in units],
+                          | {"derivedState": (u.get("derived") or {}).get("state"),
+                             # **`state: running` と期限切れは両立する**。切れているとツール側の
+                             # 記録は ambient に落ちるので、残り秒と期限切れを一次情報として出す
+                             "heartbeat": attention.heartbeat_window(u)}
+                          for u in units],
                          ensure_ascii=False, indent=1))
         return EXIT_OK
     if not units:
@@ -425,11 +484,19 @@ def cmd_units(args) -> int:
     for unit in units:
         derived = unit.get("derived") or {}
         owner = unit.get("owner") or {}
+        window = attention.heartbeat_window(unit)
+        if window["unknown"]:
+            ttl_text = "**時刻が読めないため期限切れ扱い（ツールの記録は ambient に落ちる）**"
+        elif window["overdue"]:
+            ttl_text = (f"**TTL 切れ（{-window['remainingSec']}秒超過）"
+                        "→ ツールの記録は ambient に落ちる。heartbeat --ttl を伸ばす**")
+        else:
+            ttl_text = f"TTL 残り {window['remainingSec']}秒"
         print("{:<26} {:<16} {:<34} {}".format(
             unit.get("unitId", "?"), derived.get("state", "?"),
             (unit.get("label") or "")[:32], (unit.get("activity") or "")[:40]))
-        print("{:<26} {} / 最終更新 {}".format(
-            "", owner.get("agent") or "?", unit.get("lastHeartbeat") or "?"))
+        print("{:<26} {} / 最終更新 {} / {}".format(
+            "", owner.get("agent") or "?", unit.get("lastHeartbeat") or "?", ttl_text))
     return EXIT_OK
 
 
