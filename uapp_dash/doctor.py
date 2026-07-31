@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import (__version__, agents as agents_mod, aggregate, attention,
                claims as claims_mod, protocol as P)
-from .store import StatusStore
+from .store import StatusStore, gitignore_candidates, has_status_dir_entry
 
 OK = "ok"
 NG = "ng"
@@ -155,16 +155,19 @@ def _check_status_dir(store: StatusStore) -> list[dict]:
 
 
 def _check_gitignore(project_root: Path) -> list[dict]:
-    if not (project_root / ".git").exists():
-        return [_check(INFO, ".gitignore に .agent-status/ がある", "git リポジトリではない（対象外）")]
-    gitignore = project_root / ".gitignore"
-    entry = f"{P.STATUS_DIR_NAME}/"
-    if gitignore.exists():
-        lines = [line.strip() for line in gitignore.read_text(encoding="utf-8", errors="replace").splitlines()]
-        if entry in lines or P.STATUS_DIR_NAME in lines:
-            return [_check(OK, ".gitignore に .agent-status/ がある")]
-    return [_check(NG, ".gitignore に .agent-status/ がある", str(gitignore),
-                   "`uapp-dash init` が追記する（ホスト名・絶対パス・pid を含むのでコミットしない）")]
+    # git ルートは上位へ辿って探す（Unity プロジェクトがリポジトリのサブディレクトリにある
+    # `<repo>/<unity-project>` 構成で「git リポジトリではない」と誤判定しない）。
+    # 除外記述は プロジェクト直下 / git ルートの .gitignore / .git/info/exclude のどこでもよい
+    git_root, candidates = gitignore_candidates(project_root)
+    if git_root is None:
+        return [_check(INFO, ".gitignore に .agent-status/ がある",
+                       "git リポジトリではない（上位にも .git が無い・対象外）")]
+    for file in candidates:
+        if has_status_dir_entry(file):
+            return [_check(OK, ".gitignore に .agent-status/ がある", str(file))]
+    return [_check(NG, ".gitignore に .agent-status/ がある", str(git_root / ".gitignore"),
+                   "`uapp-dash init` が追記する（ホスト名・絶対パス・pid を含むのでコミットしない。"
+                   "diff を汚したくなければ `init --git-exclude` でローカル除外へ書ける）")]
 
 
 def _check_registry(project_root: Path) -> list[dict]:

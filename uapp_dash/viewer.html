@@ -392,6 +392,9 @@ function sigilText(name) {
   const parts = clean.split(/[-_.\s\/]+/).filter(Boolean);
   return (parts.length >= 2 ? parts[0][0] + parts[1][0] : clean.slice(0, 2)).toUpperCase();
 }
+// 同名プロジェクトが並ぶと集約側が displayName を「親フォルダ名/自身」へ切り替える。
+// sigil も同じ文字列から作らないと、衝突した全プロジェクトの短縮コードが同じ 2 文字に潰れる
+function sigilOf(project) { return sigilText(project.displayName || project.name); }
 function stateOf(unit) { return (unit.derived || {}).state || unit.state || "running"; }
 /* スパークライン: 直近 60 分のイベント数。数字より「動いているか」が早く読める */
 function sparkline(buckets, color) {
@@ -500,7 +503,7 @@ function projectCard(project, index, showDone) {
   card.append(el("a", {class: "cardlink", href: projectHref(project),
                        title: "プロジェクト詳細を開く"},
     el("div", {class: "chead"},
-      el("span", {class: "sigil"}, sigilText(project.name)),
+      el("span", {class: "sigil"}, sigilOf(project)),
       el("span", {class: "name"}, project.displayName || project.name),
       el("span", {class: "flag", style: `--c: var(--${flagColor})`},
         attn ? `!${attn}` : running ? "OK" : "IDLE"))));
@@ -604,7 +607,7 @@ function queuePanel(fleet, projectsById) {
           el("span", {}, priority), el("span", {}, "·"), el("span", {}, label),
           el("span", {class: "spacer"}), agoNode(item.sinceAt, "micro")),
         el("div", {class: "qtitle"},
-          el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilText(project.name)),
+          el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilOf(project)),
           " " + (item.project || "") + " / " + item.title),
         el("div", {class: "qwhy"}, item.reason || CAT_LABEL[item.category] || ""))));
   });
@@ -809,7 +812,7 @@ function drawProjectDetail(fleet, project) {
   const box = document.getElementById("detailView");
   box.append(crumbs({text: "Fleet", href: "#/"}, {text: project.displayName || project.name}));
   box.append(el("div", {class: "dhead"},
-    el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilText(project.name)),
+    el("span", {class: "sigil", style: `--pc: var(${paletteVar(project)})`}, sigilOf(project)),
     el("h2", {}, project.displayName || project.name),
     el("span", {class: "path"}, project.path),
     sparkline(project.activityBuckets, project.runningCount ? "var(--blue)" : "var(--slate)")));

@@ -83,6 +83,9 @@ def _expected_convention(agent: str) -> str:
     assert source.exists(), f"同梱ソースが見つからない: {source}（配布物が壊れている）"
     env = dict(os.environ)
     env["PYTHONPATH"] = str(SOURCE_ROOT)
+    # 期待値もパイプ経由で受け取るので UTF-8 を強制する（env フィクスチャと同じ理由。
+    # 無指定だと日本語 Windows の既定 cp932 で書かれ、utf-8 デコードに失敗して期待値が作れない）
+    env["PYTHONIOENCODING"] = "utf-8"
     result = subprocess.run(
         [sys.executable, "-c",
          "from uapp_dash import agents; import sys; "

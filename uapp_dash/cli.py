@@ -13,7 +13,8 @@ from pathlib import Path
 
 from . import (__version__, agents as agents_mod, aggregate, attention, claims as claims_mod,
                doctor as doctor_mod, protocol as P, render)
-from .store import RELEASE_BUSY, RELEASE_NOT_OWNER, RELEASE_SETTLED, StatusStore, default_owner
+from .store import (RELEASE_BUSY, RELEASE_NOT_OWNER, RELEASE_SETTLED, StatusStore, default_owner,
+                    git_exclude_path, gitignore_candidates, has_status_dir_entry)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -77,25 +78,40 @@ GITIGNORE_PRESENT = "present"
 GITIGNORE_NO_REPO = "not-a-git-repo"
 
 
-def ensure_gitignore(project_root: Path) -> str:
-    """`.agent-status/` を .gitignore へ追記する（git リポジトリのときだけ・重複追記しない）。"""
-    if not (project_root / ".git").exists():
-        return GITIGNORE_NO_REPO
-    gitignore = project_root / ".gitignore"
+def ensure_gitignore(project_root: Path, *, use_exclude: bool = False) -> tuple[str, Path | None]:
+    """`.agent-status/` の除外記述を保証し、(結果, 対象ファイル) を返す。
+
+    git ルートは上位へ辿って探す（`<repo>/<unity-project>` 構成でプロジェクト直下に
+    `.git` が無くても「リポジトリではない」と誤判定しない）。既に書かれていれば触らない。
+    追記先は git ルートの .gitignore、`use_exclude=True` なら `.git/info/exclude`
+    （コミットされないローカル除外。リリースブランチの diff を汚したくない場合に使う）。
+    """
+    project_root = Path(project_root).resolve()
+    git_root, candidates = gitignore_candidates(project_root)
+    if git_root is None:
+        return GITIGNORE_NO_REPO, None
+    for file in candidates:
+        if has_status_dir_entry(file):
+            return GITIGNORE_PRESENT, file
     entry = f"{P.STATUS_DIR_NAME}/"
-    if gitignore.exists():
-        lines = [line.strip() for line in gitignore.read_text(encoding="utf-8", errors="replace").splitlines()]
-        if entry in lines or P.STATUS_DIR_NAME in lines:
-            return GITIGNORE_PRESENT
-        text = gitignore.read_text(encoding="utf-8", errors="replace")
+    if use_exclude:
+        target = git_exclude_path(git_root)
+        if target is None:
+            # gitdir ポインタが読めない形式。壊すよりは .gitignore へ倒す
+            target = git_root / ".gitignore"
+    else:
+        target = git_root / ".gitignore"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        text = target.read_text(encoding="utf-8", errors="replace")
         prefix = "" if text.endswith("\n") or not text else "\n"
-        with gitignore.open("a", encoding="utf-8", newline="\n") as fh:
+        with target.open("a", encoding="utf-8", newline="\n") as fh:
             fh.write(f"{prefix}\n# エージェント開発ステータス（ホスト固有の一時状態）\n{entry}\n")
-        return GITIGNORE_ADDED
-    gitignore.write_text(
-        f"# エージェント開発ステータス（ホスト固有の一時状態）\n{entry}\n", encoding="utf-8"
-    )
-    return GITIGNORE_ADDED
+    else:
+        target.write_text(
+            f"# エージェント開発ステータス（ホスト固有の一時状態）\n{entry}\n", encoding="utf-8"
+        )
+    return GITIGNORE_ADDED, target
 
 
 # --- サブコマンド -------------------------------------------------------
@@ -127,15 +143,15 @@ def cmd_init(args) -> int:
     store = _store(args)
     store.ensure()
     project_root = store.project_root
-    gitignore = ensure_gitignore(project_root)
+    gitignore, gitignore_path = ensure_gitignore(project_root, use_exclude=bool(args.git_exclude))
     print(f"作成: {store.root}")
     # 「やらなかった」ことも言う（黙って何も出さないと、追記漏れなのか既存なのか分からない）
     if gitignore == GITIGNORE_ADDED:
-        print(f"追記: {project_root / '.gitignore'} に {P.STATUS_DIR_NAME}/")
+        print(f"追記: {gitignore_path} に {P.STATUS_DIR_NAME}/")
     elif gitignore == GITIGNORE_PRESENT:
-        print(f"確認: {project_root / '.gitignore'} には {P.STATUS_DIR_NAME}/ が既にある（追記なし）")
+        print(f"確認: {gitignore_path} には {P.STATUS_DIR_NAME}/ が既にある（追記なし）")
     else:
-        print(f"対象外: git リポジトリではないので .gitignore は触らない（{project_root}）")
+        print(f"対象外: git リポジトリではない（上位にも .git が無い）ので除外記述は触らない（{project_root}）")
     aggregate.register_project(project_root)
     if args.agents:
         _install_agent_rules(project_root, args.agents, store.root)
@@ -206,7 +222,7 @@ def cmd_begin(args) -> int:
     store = _store(args)
     store.ensure()
     project_root = store.project_root
-    ensure_gitignore(project_root)
+    ensure_gitignore(project_root)  # 戻り値は見ない（begin の本流は申告。除外は最善努力）
 
     unit_id = args.unit_id or P.make_unit_id()
     if not P.valid_unit_id(unit_id):
@@ -518,6 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help=".agent-status を作成し .gitignore に追記する")
+    p_init.add_argument("--git-exclude", action="store_true",
+                        help=".gitignore でなく git のローカル除外（.git/info/exclude）へ追記する"
+                             "（コミットされないのでリポジトリの diff を汚さない。他の作業者には共有されない）")
     p_init.add_argument("--agents", choices=list(agents_mod.AGENT_CHOICES),
                         help="AI 向けの申告規約を配置する（claude=.claude/rules/agent-dash.md / "
                              "codex=ルートの AGENTS.md。既存の AGENTS.md は書き換えずスニペットを表示する）")

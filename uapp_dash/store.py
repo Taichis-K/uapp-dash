@@ -145,6 +145,78 @@ def read_json(path: Path, retries: int = 1) -> dict | None:
     return None
 
 
+def find_git_root(start: Path) -> Path | None:
+    """`.git` を上位へ辿って git ルートを返す（無ければ None）。
+
+    Unity プロジェクトがリポジトリのサブディレクトリに置かれる構成
+    （モノレポ・サブモジュール併用の `<repo>/<unity-project>`）は珍しくない。
+    プロジェクト直下だけを見ると「git リポジトリではない」と誤判定する。
+    `.git` はディレクトリとは限らない（worktree / submodule では gitdir ポインタの
+    ファイル）ので exists で見る。
+    """
+    start = Path(start).resolve()
+    for base in [start, *start.parents]:
+        if (base / ".git").exists():
+            return base
+    return None
+
+
+def git_exclude_path(git_root: Path) -> Path | None:
+    """git のローカル除外ファイル（info/exclude）の実体パスを返す。
+
+    `.git` がファイル（worktree / submodule）の場合は gitdir ポインタを辿る。
+    worktree の gitdir はさらに commondir 経由で本体を指すので 1 段だけ追う。
+    形式が読めなければ None（呼び手は「分からないので触らない」へ倒す）。
+    """
+    dot_git = Path(git_root) / ".git"
+    if dot_git.is_dir():
+        return dot_git / "info" / "exclude"
+    try:
+        text = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = (Path(git_root) / text[len("gitdir:"):].strip()).resolve()
+    common = gitdir / "commondir"
+    if common.is_file():
+        try:
+            gitdir = (gitdir / common.read_text(encoding="utf-8").strip()).resolve()
+        except OSError:
+            return None
+    return gitdir / "info" / "exclude"
+
+
+def has_status_dir_entry(file: Path) -> bool:
+    """行単位で `.agent-status/`（または `.agent-status`）の除外記述があるか。"""
+    if not file.is_file():
+        return False
+    entry = f"{P.STATUS_DIR_NAME}/"
+    lines = [line.strip() for line in file.read_text(encoding="utf-8", errors="replace").splitlines()]
+    return entry in lines or P.STATUS_DIR_NAME in lines
+
+
+def gitignore_candidates(project_root: Path) -> tuple[Path | None, list[Path]]:
+    """(git ルート, `.agent-status/` の除外記述を探すファイル群) を返す。
+
+    プロジェクト直下だけでなく git ルート（`<repo>/<unity-project>` 構成）の .gitignore と、
+    リポジトリの diff を汚さないローカル除外（.git/info/exclude）も候補に入れる。
+    `.agent-status/` はスラッシュ始まりでないパターンなので、どの階層の .gitignore に
+    書かれていても配下すべてに効く。
+    """
+    project_root = Path(project_root).resolve()
+    git_root = find_git_root(project_root)
+    if git_root is None:
+        return None, []
+    candidates = [project_root / ".gitignore"]
+    if git_root != project_root:
+        candidates.append(git_root / ".gitignore")
+    exclude = git_exclude_path(git_root)
+    if exclude is not None:
+        candidates.append(exclude)
+    return git_root, candidates
+
+
 def find_project_root(start: Path | None = None) -> Path:
     """`.agent-status` → `.git` の順に上位へ探し、無ければ起点を返す。"""
     cur = (start or Path.cwd()).resolve()

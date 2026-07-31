@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -148,6 +149,10 @@ _CONVENTION_BODY = """\
 uapp-dash view --serve --open     # 5 秒ごとに更新される表示
 uapp-dash view --out fleet.html   # 1 ファイルで完結する HTML
 ```
+
+**`view --serve` を AI が自分のバックグラウンドタスクとして起動しない**
+（AI のセッション終了と同時にダッシュボードも落ち、落ちたことに誰も気づけない。
+人に見せたいときは `view --out` で HTML を書き出すか、別ターミナルでの常駐を人に頼む）。
 """
 
 
@@ -248,7 +253,18 @@ def _write_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except OSError as exc:
+        # Windows では置換先を他プロセス（エディタ・同期ソフト・ウイルス対策）が開いていると
+        # ここで失敗する。**一時ファイルを残さない**: 残すと次の導入で見慣れないファイルとして
+        # 人を混乱させ、リポジトリにも紛れ込む（実際に `AGENTS.md.tmp<pid>` が残った）
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise RuntimeError(
+            f"{path} を更新できなかった（{exc.__class__.__name__}: {exc}）。"
+            "このファイルを開いているエディタや同期ソフトを閉じて `uapp-dash init` をやり直すこと"
+        ) from exc
 
 
 def _place(path: Path, text: str, recorded: str | None) -> str:
