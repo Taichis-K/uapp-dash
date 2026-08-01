@@ -403,7 +403,7 @@ def _priority_items(project: dict, *, now: datetime) -> list[dict]:
         items.append(_item(
             "conflict", "human" if hard else "watch", 1 if hard else 6,
             "編集領域の衝突" if hard else "YAML 資産の重なり注意",
-            f"{conflict.get('reason', '')}: {' ↔ '.join(conflict.get('labels') or [])}",
+            f"{conflict.get('reason', '')}: {' <-> '.join(conflict.get('labels') or [])}",
             None, paths=conflict.get("paths") or []))
 
     for resource in project["resources"]:

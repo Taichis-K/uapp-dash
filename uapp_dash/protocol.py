@@ -231,7 +231,7 @@ def ttl_of(unit: dict) -> int:
             number = None
     elif isinstance(value, str):
         try:
-            number = int(value.strip())  # 全角数字や "²" は ValueError（isdigit は真になる）
+            number = int(value.strip())  # 全角数字や 上付き 2 (U+00B2) は ValueError（isdigit は真になる）
         except ValueError:
             number = None
     if number is None or number <= 0:

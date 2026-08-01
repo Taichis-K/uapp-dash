@@ -1,4 +1,4 @@
-"""`uapp-dash doctor` — 導入状況の自己診断。
+"""`uapp-dash doctor` ― 導入状況の自己診断。
 
 導入した AI が「入ったつもり」で終わらないよう、**実際に読み書きして確かめる**。
 判定は次の 3 種類に絞る:
@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 
@@ -33,6 +34,18 @@ def _check(status: str, title: str, detail: str = "", hint: str = "") -> dict:
 
 INSTALL_HINT = ("リポジトリ直下で `pip install -e .`（または `pip install .`）を実行する。"
                 "入れずに使うなら `python -m uapp_dash` / `python -m uapp_dash.emit`")
+
+# **「入れたはずなのに無い / 動かない」の典型はウイルス対策**。pip が作る launcher exe は
+# 未署名で、隔離・実行ブロック・解析待ちのどれもが「pip install は成功したのに使えない」形で出る。
+# 原因に見当が付かないと `pip install` を何度も繰り返すことになるので、候補として必ず出す
+ANTIVIRUS_HINT = (
+    "`pip install` が成功しているのにこうなる場合、**ウイルス対策が launcher exe を隔離/ブロック**"
+    "している可能性がある（未署名かつレピュテーションが無いため。隔離ログを確認する）。"
+    "対処は 3 つ: (1) インストール先を除外に登録して `pip install --force-reinstall --no-deps .`"
+    "（再生成でハッシュが変わり判定が覆ることがある） "
+    "(2) 除外に登録できる場所へ venv を作り直してそこへ入れる "
+    "(3) exe を使わず `python -m uapp_dash` / `python -m uapp_dash.emit` で運用する"
+    "（申告規約の `uapp-dash …` を読み替える）")
 
 VERSION_LINE = f"uapp-dash {__version__}"
 
@@ -113,23 +126,189 @@ def _round_trip(exe: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _script_dirs() -> list[Path]:
+    """launcher exe が置かれうる場所（除外登録の宛先として出す）。
+
+    **`sysconfig.get_path("scripts")` 1 本では足りない** ― 既定 scheme の Scripts しか返さず、
+    SETUP が失敗時の手として案内している `pip install --user .` の launcher は
+    `nt_user` scheme の側（`%APPDATA%\\Python\\PythonXY\\Scripts`）に置かれる。
+    片方だけ見ると、正しく入っているのに「インストール先に存在しない＝隔離された」と誤診し、
+    利用者を無関係なウイルス対策の調査へ送り込むことになる。
+    """
+    dirs: list[Path] = []
+    schemes: list[str | None] = [None]
+    try:
+        schemes.append(sysconfig.get_preferred_scheme("user"))
+    except (KeyError, ValueError, AttributeError):
+        pass
+    for scheme in schemes:
+        try:
+            raw = (sysconfig.get_path("scripts") if scheme is None
+                   else sysconfig.get_path("scripts", scheme))
+        except (KeyError, ValueError):
+            continue
+        if raw and Path(raw) not in dirs:
+            dirs.append(Path(raw))
+    return dirs
+
+
+def _expected_script_dir() -> Path | None:
+    """既定 scheme の Scripts（後方互換。判定には `_script_dirs` を使うこと）。"""
+    dirs = _script_dirs()
+    return dirs[0] if dirs else None
+
+
+def _missing_hint(name: str) -> str:
+    """PATH に無い／動かないときのヒント。**在るべき場所を具体的に示す**。
+
+    「PATH に見つからない」だけでは、入れ忘れなのか消されたのかが分からない。
+    インストール先に exe が無ければ隔離を強く疑えるし、在るのに動かないなら実行ブロックを疑える。
+    """
+    parts = [INSTALL_HINT]
+    dirs = _script_dirs()
+    present = [d for d in dirs if (d / f"{name}.exe").exists()]
+    if present:
+        # **在るのに使えないなら入れ忘れではない**。PATH か実行ブロックを疑わせる
+        parts.append(f"インストール先: {present[0]}"
+                     "（exe は在る＝PATH に入っていないか、実行がブロックされている）")
+    elif os.name == "nt" and any(d.is_dir() for d in dirs):
+        listed = "、".join(str(d / f"{name}.exe") for d in dirs if d.is_dir())
+        parts.append(f"**インストール先に {listed} が存在しない**（作られていないか、消されている）")
+    elif dirs:
+        parts.append("インストール先: " + "、".join(str(d) for d in dirs))
+    parts.append(ANTIVIRUS_HINT)
+    return " / ".join(parts)
+
+
+# シム（`install-shims` が作る `.cmd`）経由で呼ばれているときに毎回出す注意。
+# **SETUP を読んだ導入者ではなく、実際にコマンドを打つ側へ届かせる**ためにここに置く
+# （申告規約は版を固定しているので、そこへは書けない）。
+SHIM_LIMITATION_CMD = (
+    "**`.cmd` は引数の値に `&` `|` `<` `>` `^` `%` が入ると壊れる**"
+    "（`--label \"A&B\"` はラベルが `A` になり、`B` がコマンドとして実行される）。"
+    "`cmd` がコマンドラインを読む時点で起きるため `.cmd` 側では直せない")
+SHIM_HAS_PS1 = (
+    "PowerShell からは併設の `.ps1` が優先されるので、実運用の経路（申告規約・"
+    "キットのラッパー）では引数は無傷で届く。**cmd.exe や Python の subprocess から"
+    "呼ぶ場合はこの制限が生きる**")
+SHIM_NO_PS1 = (
+    "**`.ps1` が併設されていないので、PowerShell から呼んでもこの制限が生きる**。"
+    "自由テキスト（`--label` / `--summary` / `--activity` / `--reason`）に"
+    "これらの文字を入れないこと。入りうるなら `python -m uapp_dash …` で運用するか、"
+    "`install-shims` をやり直して `.ps1` を置けるようにする")
+
+
+def _is_shim(path: str) -> bool:
+    """その実行ファイルが、このツールの作った `.cmd` シムか。
+
+    拡張子だけで決めない（利用者の別ラッパーかもしれない）。生成時に必ず入る目印を見る。
+    """
+    if not path.lower().endswith(".cmd"):
+        return False
+    try:
+        return 'uapp-dash install-shims' in Path(path).read_text(encoding="ascii",
+                                                                 errors="replace")
+    except OSError:
+        return False
+
+
+def _ps1_versions(script: Path) -> dict[str, str | None]:
+    """併設 `.ps1` を**利用できる PowerShell すべてで実走**し、シェルごとの版を返す。
+
+    **存在確認では足りない**。`.cmd` と `.ps1` は別々のファイルなので、更新が途中で
+    失敗すれば「`.cmd` は新版・`.ps1` は旧版」という混在が残る。PowerShell は `.ps1` を
+    優先するので、その状態では `doctor` が確かめた `.cmd` とは別の版が実運用で動く。
+
+    **最初に見つかったシェルだけで合格にしない**。実行ポリシーや `#requires` の違いで
+    「pwsh では動くが Windows PowerShell 5.1 では動かない」が起きうる。5.1 でも `.ps1` は
+    `.cmd` より優先されるので、5.1 の利用者はコマンドを実行できないままになる。
+    """
+    results: dict[str, str | None] = {}
+    for shell in ("pwsh", "powershell"):
+        exe = shutil.which(shell)
+        if not exe:
+            continue
+        try:
+            proc = _run([exe, "-NoProfile", "-NonInteractive", "-File", str(script), "--version"])
+        except (OSError, subprocess.SubprocessError):
+            results[shell] = None
+            continue
+        results[shell] = (proc.stdout or "").strip() if proc.returncode == 0 else None
+    return results
+
+
+def _shim_limitation(shim_paths: list[str]) -> str:
+    """シム利用時の注意文。**`.ps1` が隣にあるかで危険度がまるで違う**ので書き分ける。"""
+    has_ps1 = all(Path(p).with_suffix(".ps1").exists() for p in shim_paths)
+    return SHIM_LIMITATION_CMD + "。" + (SHIM_HAS_PS1 if has_ps1 else SHIM_NO_PS1)
+
+
+def _check_ps1_shims(shim_paths: list[str]) -> list[dict]:
+    """併設 `.ps1` が `.cmd` と同じ版を実行するか（混在の検出）。"""
+    checks = []
+    for cmd_path in shim_paths:
+        ps1 = Path(cmd_path).with_suffix(".ps1")
+        if not ps1.exists():
+            continue
+        name = ps1.stem
+        expected = f"{name} {__version__}"
+        results = _ps1_versions(ps1)
+        if not results:
+            continue                       # PowerShell が無い環境（`.cmd` だけで運用する）
+        broken = [sh for sh, v in results.items() if v is None]
+        mismatched = {sh: v for sh, v in results.items() if v is not None and v != expected}
+        if broken:
+            checks.append(_check(NG, f"併設の {name}.ps1 が動く",
+                                 f"{ps1} ― {'、'.join(broken)} で実行できない"
+                                 f"（試したシェル: {'、'.join(results)}）",
+                                 "PowerShell は `.cmd` より `.ps1` を優先するので、"
+                                 "動かない `.ps1` があるとそのシェルからはコマンドが使えない"
+                                 "（実行ポリシーの可能性）。"
+                                 "`install-shims --force` で作り直すか、`.ps1` を削除する"))
+        elif mismatched:
+            detail = "、".join(f"{sh}={v or '版を答えない'}" for sh, v in mismatched.items())
+            checks.append(_check(NG, f"併設の {name}.ps1 が同じ版を実行する",
+                                 f"{ps1} ― {detail}（期待: {expected}）",
+                                 "**`.cmd` と `.ps1` で違う版が動いている**"
+                                 "（更新が途中で失敗した可能性）。PowerShell は `.ps1` を"
+                                 "優先するので、実運用ではこちらが動く。"
+                                 "`install-shims --force` で作り直す"))
+        else:
+            checks.append(_check(OK, f"併設の {name}.ps1 が同じ版を実行する",
+                                 f"{ps1}（{'、'.join(results)}）"))
+    return checks
+
+
 def _check_commands() -> list[dict]:
     checks = []
+    shim_paths = []
     for name in ("uapp-dash", "uapp-dash-emit"):
         exe = shutil.which(name)
         if not exe:
-            checks.append(_check(NG, f"コマンド {name} が使える", "PATH に見つからない", INSTALL_HINT))
+            checks.append(_check(NG, f"コマンド {name} が使える", "PATH に見つからない",
+                                 _missing_hint(name)))
             continue
         ok, detail = _responds(exe, f"usage: {name}")
         if not ok:
-            checks.append(_check(NG, f"コマンド {name} が使える", f"{exe} — {detail}", INSTALL_HINT))
+            checks.append(_check(NG, f"コマンド {name} が使える", f"{exe} ― {detail}",
+                                 _missing_hint(name)))
             continue
         if name == "uapp-dash":
             works, why = _round_trip(exe)
             if not works:
-                checks.append(_check(NG, "コマンド uapp-dash が実際に動く", f"{exe} — {why}", INSTALL_HINT))
+                checks.append(_check(NG, "コマンド uapp-dash が実際に動く", f"{exe} ― {why}",
+                                     _missing_hint(name)))
                 continue
         checks.append(_check(OK, f"コマンド {name} が使える", exe))
+        if _is_shim(exe):
+            shim_paths.append(exe)
+    if shim_paths:
+        # **detail に入れる**（表示は NG のときしか hint を出さないため。
+        # ここは異常ではないので NG にはできないが、毎回目に入る必要がある）。
+        # 2 コマンド分を 1 件にまとめる（同じ長文を二度読ませない）
+        checks.append(_check(INFO, "コマンドはシム（制限あり）",
+                             ", ".join(shim_paths) + " ― " + _shim_limitation(shim_paths)))
+        checks.extend(_check_ps1_shims(shim_paths))
     return checks
 
 
@@ -180,7 +359,7 @@ def _check_registry(project_root: Path) -> list[dict]:
 
 
 def _agent_hint(project_root: Path, agent: str, path: Path) -> str:
-    hint = f"`uapp-dash --project {project_root} init --agents {agent}` を実行する"
+    hint = (f"`uapp-dash --project {agents_mod.quote_for_cmd(project_root)} init --agents {agent}` を実行する")
     if path.exists():
         hint += ("（既存ファイルは自動で書き換えないので、表示されるスニペットを begin/end マーカーごと"
                  "そのまま統合する。古い規約ブロックが残っていれば消す）")
@@ -193,8 +372,20 @@ def _check_agent_rules(project_root: Path, status_dir: Path) -> list[dict]:
     片方でも [済] にすると、既存の AGENTS.md があるプロジェクト（Codex 利用者の普通の状態）で
     「Claude 側だけ入って Codex 側は未統合」を見逃し、ダッシュボードが空のまま導入成功に見える。
     """
-    found = agents_mod.convention_present(project_root)
+    conv = agents_mod.convention_state(project_root)
+    found = {agent: st == agents_mod.CONVENTION_OK for agent, st in conv.items()}
     paths = {agent: project_root / relpath for agent, relpath in agents_mod.RELPATHS.items()}
+
+    def _detail_and_hint(agent, *, requested=True):
+        """「無い」と「古い」で、状況の書き方も直し方も変える。"""
+        if conv[agent] == agents_mod.CONVENTION_OUTDATED:
+            return (f"**旧版が配置されている**: {paths[agent]}（ファイルはあるが規約が現行と違う）",
+                    f"`uapp-dash --project {agents_mod.quote_for_cmd(project_root)} init --agents {agent} --replace-marker-block` で"
+                    "マーカー間だけ差し替える（マーカー外の記述は触らない）")
+        # 要求していない種別まで「要求済みなのに置かれていない」と書かない（読み手が混乱する）
+        note = "（要求済みなのに置かれていない）" if requested else ""
+        return (f"未配置: {paths[agent]}{note}",
+                _agent_hint(project_root, agent, paths[agent]))
     requested = agents_mod.requested_agents(status_dir)
     state = agents_mod.manifest_state(status_dir)
     extra: list[dict] = []
@@ -207,7 +398,7 @@ def _check_agent_rules(project_root: Path, status_dir: Path) -> list[dict]:
                             (f"壊れている: {status_dir / agents_mod.MANIFEST_NAME}" if broken else
                              f"記録が無い（{status_dir / agents_mod.MANIFEST_NAME}）。規約は在るが、"
                              "どの種別を要求したのか分からない＝欠落を検出できない"),
-                            f"`uapp-dash --project {project_root} init --agents <claude|codex|both>` で"
+                            f"`uapp-dash --project {agents_mod.quote_for_cmd(project_root)} init --agents <claude|codex|both>` で"
                             "作り直す（既存ファイルは書き換えない）"))
     if requested:
         checks = list(extra)
@@ -215,9 +406,8 @@ def _check_agent_rules(project_root: Path, status_dir: Path) -> list[dict]:
             if found[agent]:
                 checks.append(_check(OK, f"申告規約が配置済み（{agent}）", str(paths[agent])))
             else:
-                checks.append(_check(NG, f"申告規約が配置済み（{agent}）",
-                                     f"未配置: {paths[agent]}（要求済みなのに置かれていない）",
-                                     _agent_hint(project_root, agent, paths[agent])))
+                detail, hint = _detail_and_hint(agent)
+                checks.append(_check(NG, f"申告規約が配置済み（{agent}）", detail, hint))
         for agent in agents_mod.AGENT_NAMES:
             if agent not in requested and found[agent]:
                 checks.append(_check(INFO, f"申告規約（{agent}）", f"配置あり（未要求）: {paths[agent]}"))
@@ -230,8 +420,20 @@ def _check_agent_rules(project_root: Path, status_dir: Path) -> list[dict]:
                                  "配置先: " + ", ".join(str(paths[a]) for a in placed))]
         for agent in agents_mod.AGENT_NAMES:
             if agent not in placed:
-                checks.append(_check(INFO, f"申告規約（{agent}）", f"未配置: {paths[agent]}",
-                                     _agent_hint(project_root, agent, paths[agent])))
+                detail, hint = _detail_and_hint(agent, requested=False)
+                checks.append(_check(INFO, f"申告規約（{agent}）", detail, hint))
+        return checks
+    # 記録も要求も無くても、**現物を見れば「旧版が置かれている」ことは分かる**。
+    # `.agent-status/` は丸ごと gitignore される＝別クローンや掃除のあとは記録が無いのが普通なので、
+    # ここを一般論の「配置されていない」に丸めると、その状況では必ず
+    # 「100 行を手で貼り直す」案内に戻ってしまう（§14 で無くしたはずの作業）
+    if any(st == agents_mod.CONVENTION_OUTDATED for st in conv.values()):
+        checks = list(extra)
+        for agent in agents_mod.AGENT_NAMES:
+            outdated = conv[agent] == agents_mod.CONVENTION_OUTDATED
+            detail, hint = _detail_and_hint(agent, requested=False)
+            checks.append(_check(NG if outdated else INFO,
+                                 f"申告規約が配置済み（{agent}）", detail, hint))
         return checks
     return [*extra, _check(NG, "申告規約が配置済み（AI が uapp-dash を打つ導線）",
                            "これが無いと AI は申告すべきだと知らず、ダッシュボードは埋まらない",
@@ -429,7 +631,7 @@ def format_checks(project_root: Path, checks: list[dict]) -> str:
     for check in checks:
         line = f"{_LABEL[check['status']]} {check['title']}"
         if check["detail"]:
-            line += f" — {check['detail']}"
+            line += f" ― {check['detail']}"
         lines.append(line)
         if check["status"] == NG and check["hint"]:
             lines.append(f"      → {check['hint']}")

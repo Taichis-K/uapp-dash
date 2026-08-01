@@ -1,4 +1,4 @@
-"""`uapp-dash-emit` — ツールラッパー専用の客観エビデンス出力。
+"""`uapp-dash-emit` ― ツールラッパー専用の客観エビデンス出力。
 
 エージェントの自己申告 CLI（`uapp-dash`）とはエントリポイントを分けている（判断 E）。
 ラッパーに組み込む前提のため、**失敗しても終了コードを汚さない**（既定で常に 0）。
@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, attention, protocol as P
+from . import console
 from .proc import hostname
 from .store import StatusStore
 
@@ -195,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    console.make_output_safe()
     verbose = bool(argv and ("--verbose" in argv or "--strict" in argv))
     strict = bool(argv and "--strict" in argv)
     try:

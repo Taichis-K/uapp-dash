@@ -1,4 +1,4 @@
-"""`uapp-dash` — エージェントの自己申告（claim 系）だけを扱う CLI。
+"""`uapp-dash` ― エージェントの自己申告（claim 系）だけを扱う CLI。
 
 **evidence 系のサブコマンドはここに置かない**（判断 E）。ツールからの客観エビデンスは
 `uapp-dash-emit`（uapp_dash.emit）から書く。
@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from . import (__version__, agents as agents_mod, aggregate, attention, claims as claims_mod,
-               doctor as doctor_mod, protocol as P, render)
+               console, doctor as doctor_mod, protocol as P, render, shims)
 from .store import (RELEASE_BUSY, RELEASE_NOT_OWNER, RELEASE_SETTLED, StatusStore, default_owner,
                     git_exclude_path, gitignore_candidates, has_status_dir_entry)
 
@@ -117,14 +117,18 @@ def ensure_gitignore(project_root: Path, *, use_exclude: bool = False) -> tuple[
 # --- サブコマンド -------------------------------------------------------
 
 
-def _install_agent_rules(project_root: Path, agents: str, status_dir: Path) -> None:
+def _install_agent_rules(project_root: Path, agents: str, status_dir: Path,
+                         *, replace_block: bool = False) -> None:
     """申告規約を配置し、結果を人に分かる形で出す（既存ファイルは書き換えない）。"""
-    for result in agents_mod.install(project_root, agents, status_dir=status_dir):
+    for result in agents_mod.install(project_root, agents, status_dir=status_dir,
+                                     replace_block=replace_block):
         path, status = result["path"], result["status"]
         if status == agents_mod.CREATED:
             print(f"作成: {path}（{result['agent']} 向けの申告規約）")
         elif status == agents_mod.UPDATED:
             print(f"更新: {path}（{result['agent']} 向けの申告規約）")
+        elif status == agents_mod.REPLACED_BLOCK:
+            print(f"更新: {path}（マーカー間の規約だけ差し替え。マーカー外の記述はそのまま）")
         elif status == agents_mod.UNCHANGED:
             print(f"変更なし: {path}")
         else:
@@ -132,8 +136,18 @@ def _install_agent_rules(project_root: Path, agents: str, status_dir: Path) -> N
                 print(f"変更しなかった: {path}（このツールが書いた後で編集されているため上書きしない）")
             else:   # SKIPPED_FOREIGN
                 print(f"変更しなかった: {path}（このツールが作ったファイルではないため自動では書き換えない）")
-            print("以下を手で統合すること（begin/end マーカー行ごと一字一句そのまま貼る。"
-                  "古い規約ブロックが残っていれば消す — 併存していると診断は未了のまま）:")
+            # **手で 100 行貼る作業を勧めない**（導入先で 3 版連続の手作業になり、事故のもとだった）。
+            # マーカーがあるなら機械的に差し替えられる
+            if agents_mod.has_managed_block(path):
+                print("マーカー間だけ差し替えるなら（マーカー外の記述は触りません）:")
+                print(f"  uapp-dash --project {agents_mod.quote_for_cmd(project_root)} init "
+                      f"--agents {result['agent']} --replace-marker-block")
+            else:
+                print(f"規約ブロックだけをファイルへ書き出すなら（手で差し込む用）:")
+                print(f"  uapp-dash --project {agents_mod.quote_for_cmd(project_root)} init "
+                      f"--agents {result['agent']} --emit-convention <出力先>")
+            print("手で統合する場合は以下を begin/end マーカー行ごと一字一句そのまま貼る"
+                  "（古い規約ブロックが残っていれば消す ― 併存していると診断は未了のまま）:")
             print("-" * 60)
             print(agents_mod.render(result["agent"]))
             print("-" * 60)
@@ -141,6 +155,29 @@ def _install_agent_rules(project_root: Path, agents: str, status_dir: Path) -> N
 
 def cmd_init(args) -> int:
     store = _store(args)
+    # 規約ブロックの書き出しは**配置とは別の関心事**（`.agent-status` も作らず、何も変更しない）。
+    # 自分の手順で差し込みたい人が、標準出力からのコピペで崩さずに済むようにする
+    if getattr(args, "emit_convention", None):
+        if not args.agents or args.agents == "both":
+            raise SystemExit("--emit-convention は書き出す種別が要る: --agents claude | codex")
+        out = Path(args.emit_convention)
+        # **既存ファイルは絶対に切り詰めない**。出力先に AGENTS.md のような実ファイルを
+        # 指定されたら、守るべきユーザーの記述を丸ごと消してしまう
+        # （規約を守らせるための機能が規約を消す）。マーカーの有無で「自分の物」と
+        # 判断しないのはこのモジュール全体の原則でもある ― マーカーは統合用スニペットにも
+        # 入るので、所有の証拠にならない。
+        # **`exists()` で確かめてから書く形にはしない**（確認と書き込みの間に別プロセスが
+        # 作ったファイルを切り詰める）。OS の排他的作成（"x"）に判定そのものを任せる
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with out.open("x", encoding="utf-8", newline="\n") as fh:
+                fh.write(agents_mod.render(args.agents))
+        except FileExistsError:
+            raise SystemExit(f"--emit-convention の出力先が既にある: {out}"
+                             "（既存ファイルは上書きしない。別のパスを指定するか、"
+                             "不要なら消してから実行する）") from None
+        print(f"書き出し: {out}（{args.agents} 向けの規約ブロック。begin/end マーカーを含む）")
+        return EXIT_OK
     store.ensure()
     project_root = store.project_root
     gitignore, gitignore_path = ensure_gitignore(project_root, use_exclude=bool(args.git_exclude))
@@ -154,10 +191,61 @@ def cmd_init(args) -> int:
         print(f"対象外: git リポジトリではない（上位にも .git が無い）ので除外記述は触らない（{project_root}）")
     aggregate.register_project(project_root)
     if args.agents:
-        _install_agent_rules(project_root, args.agents, store.root)
+        _install_agent_rules(project_root, args.agents, store.root,
+                             replace_block=bool(getattr(args, "replace_marker_block", False)))
     else:
         print("ヒント: `uapp-dash init --agents both` で AI 向けの申告規約を配置できる"
               "（これが無いと AI は uapp-dash を打つべきだと知らない）")
+    return EXIT_OK
+
+
+def cmd_install_shims(args) -> int:
+    """exe を作れない環境向けに、同じコマンド名で呼べる `.cmd` を置く。
+
+    **`.agent-status` は作らない**（監視対象の設定ではなく、この端末の実行環境の話）。
+    """
+    try:
+        written = shims.install(Path(args.dir), force=bool(args.force))
+    except shims.ShimError as exc:
+        raise SystemExit(str(exc)) from exc
+    for path in written:
+        print(f"作成: {path}")
+    if not any(p.suffix == ".ps1" for p in written):
+        # **`.ps1` は PowerShell から呼んだときに引数が壊れない安全な経路**。実行ポリシーで
+        # 動かない環境では置かない（置くと `.cmd` より優先されて、動いていたものが壊れる）
+        print("注意: `.ps1` シムは置きませんでした（この環境の PowerShell では実行ポリシーにより"
+              "動かないため）。`.cmd` だけになるので、下の「壊れる引数」が **PowerShell から"
+              "呼んだ場合にも当てはまります**")
+    directory = Path(args.dir).resolve()
+    # **`quote_for_cmd` は使えない**。あれは「引数の位置」用で、安全な文字だけなら裸で出す。
+    # ここは `$env:PATH = … + ";" + …` という**式**なので、裸のパスは構文エラーになる
+    # （`D:\tools\bin + ";" + $env:PATH` は「そんなコマンドは無い」で落ちる。実測）。
+    # 式に埋めるものは常に引用する。単引用符にするのは `$` を展開させないため
+    quoted = "'" + str(directory).replace("'", "''") + "'"
+    print(f"PATH に {directory} を**前方**へ追加すると `uapp-dash` / `uapp-dash-emit` として呼べる"
+          "（exe が別の場所にあると、PATH で先に見つかった方が使われる）:")
+    print(f'  $env:PATH = {quoted} + ";" + $env:PATH        # 現在のセッションだけ')
+    # **PATH を書き換えるワンライナーは案内しない**。どれも既存の PATH を壊しうる:
+    #   - `setx` は 1024 文字で切り捨てて保存する（長い環境では実行した瞬間に後半が消える）。
+    #     さらに PowerShell の `$env:PATH` は Machine と User の合成値なので、
+    #     それを User へ書き戻すと Machine 側の全項目が User へ複製される
+    #   - `[Environment]::SetEnvironmentVariable(…, "User")` も安全ではない。
+    #     User PATH が REG_EXPAND_SZ で `%USERPROFILE%\…` を含む場合、
+    #     GetEnvironmentVariable は展開済みの値を返し、Set は REG_SZ で書き戻すため、
+    #     **参照が固定値に化けて将来の変更に追従しなくなる**（重複追加も防げない）
+    # 導入を助けるコマンドが開発環境を壊してはならないので、GUI を案内する
+    print("永続化は **GUI で行う**（PATH を書き換えるワンライナーは、"
+          "切り捨て・Machine 項目の複製・`%USERPROFILE%` 等の参照が固定値に化ける、"
+          "のいずれかを踏む）:")
+    print('  rundll32 sysdm.cpl,EditEnvironmentVariables    # 「ユーザー環境変数」の Path を編集し、')
+    print(f'                                                # 先頭に {directory} を追加する')
+    print("確認: `uapp-dash --version` が版を返し、`uapp-dash doctor` の"
+          "「コマンドが使える」が [済] になること")
+    print("注意: `.cmd` は cmd に解釈されるため、**引数の値に `&` `|` `<` `>` `^` `%` が入ると"
+          "壊れる**（`--label \"A&B\"` はラベルが \"A\" になり \"B\" が実行される＝"
+          "自由テキスト経由のコマンド実行）。**PowerShell からは併設した `.ps1` が優先される**"
+          "ので実運用の経路は安全だが、cmd.exe や Python の subprocess から呼ぶ場合は"
+          "この制限が生きる（`.ps1` を置けなかった場合は PowerShell も同じ）")
     return EXIT_OK
 
 
@@ -537,6 +625,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--git-exclude", action="store_true",
                         help=".gitignore でなく git のローカル除外（.git/info/exclude）へ追記する"
                              "（コミットされないのでリポジトリの diff を汚さない。他の作業者には共有されない）")
+    p_init.add_argument("--replace-marker-block", action="store_true",
+                        help="既存ファイルの begin/end マーカー間だけを現行の規約へ差し替える"
+                             "（マーカー外の記述は触らない）。マーカー外に自作の規約を足している"
+                             "構成で、更新のたびに全文を手で貼り直す作業をなくすためのもの")
+    p_init.add_argument("--emit-convention", metavar="PATH",
+                        help="規約ブロックをこのファイルへ書き出して終了する（配置はしない）。"
+                             "自分の手順で差し込みたい場合に使う")
     p_init.add_argument("--agents", choices=list(agents_mod.AGENT_CHOICES),
                         help="AI 向けの申告規約を配置する（claude=.claude/rules/agent-dash.md / "
                              "codex=ルートの AGENTS.md。既存の AGENTS.md は書き換えずスニペットを表示する）")
@@ -544,6 +639,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="導入状況を自己診断する（[済]/[未] 表示・未了があれば終了コード 1）")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_shims = sub.add_parser(
+        "install-shims",
+        help="exe を使わずに uapp-dash / uapp-dash-emit を名乗る .cmd を作る（Windows 専用）")
+    p_shims.add_argument("--dir", required=True, metavar="PATH",
+                         help="出力先ディレクトリ。**exe のある場所とは別**にして PATH の前方に入れる")
+    p_shims.add_argument("--force", action="store_true", help="既存の同名ファイルを上書きする")
+    p_shims.set_defaults(func=cmd_install_shims)
 
     p_begin = sub.add_parser("begin", help="開発単位を開始し unitId を出力する")
     p_begin.add_argument("--label", required=True, help="人が読む単位名")
@@ -627,6 +730,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    console.make_output_safe()
     parser = build_parser()
     args = parser.parse_args(argv)
     # view は複数プロジェクトを受け取れるようにする

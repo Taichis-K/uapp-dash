@@ -32,8 +32,34 @@ from .store import StatusStore, file_lock, write_json_atomic
 BEGIN_MARKER = "<!-- uapp-dash:convention:begin -->"
 END_MARKER = "<!-- uapp-dash:convention:end -->"
 MARKER = BEGIN_MARKER      # 後方互換の別名（呼び手は begin/end を使うこと）
+# **その行に単独で在るマーカーだけを管理領域の境界と認める**（末尾の空白は許す）。
+# 行の途中にある同じ文字列は、マーカーを説明している散文かもしれず、境界にしてはならない。
+#
+# 行頭・行末は**ゼロ幅の判定にする（`\r` も BOM も match に含めない）**。ここを
+# `[ \t\r]*$` や `^﻿?` のように「食べる」書き方にすると、管理領域の中身に
+# その 1 文字が紛れ込み、差し替えのときに一緒に消える:
+#   - CRLF のファイルで end マーカー行の `\r` を食べる → 差し替え後その行だけ LF になり、
+#     「マーカー外はバイト列のまま・改行コードも変わらない」という約束が破れる
+#   - 先頭の BOM を食べる → 現行の規約が入っていても `render()` と一致せず「旧版」と誤診し、
+#     差し替えると BOM が消える
+# `_splice_block` は改行を変換せずに読む（マーカー外をバイト列のまま保つため）ので、
+# CRLF / CR のみ / LF のどれで来ても境界を見つけられる形にしておく
+# 直前が「無い（文字列の先頭）・改行・**位置 0 の BOM**」＝行頭。
+# **BOM を無条件に許してはならない**: `(?<![^\n\r﻿])` と書くと、行の途中に現れた U+FEFF の
+# 直後まで「行頭」になり、`prefix﻿<!-- …:begin -->` が管理領域の開始と認められる。
+# つまり「散文の中のマーカーは境界にしない」という安全条件を BOM 1 文字で迂回でき、
+# その状態で `--replace-marker-block` を実行するとユーザーの記述が消える（実際に再現した）。
+# BOM を許すのは**文字列の先頭にあるときだけ**にする
+_LINE_HEAD = r"(?:(?<![\s\S])|(?<=[\n\r])|(?<=\A﻿))"
+_LINE_TAIL = r"[ \t]*(?=[\r\n]|$)"      # 行末まで空白のみ（改行そのものは含めない）
+_BEGIN_LINE_RE = re.compile(_LINE_HEAD + re.escape(BEGIN_MARKER) + _LINE_TAIL)
+_END_LINE_RE = re.compile(_LINE_HEAD + re.escape(END_MARKER) + _LINE_TAIL)
 # 1 行マーカーだけだった頃の形式。**残っていれば「古い規約が同居している」ことを意味する**
 LEGACY_MARKER = "<!-- uapp-dash:convention -->"
+
+# 案内文のコマンド引数を裸で置いてよい文字（英数字とパスの区切り・記号のみ）。
+# **許可制にする**: 禁止文字を数え上げる形だと、書き漏らした 1 文字で案内が壊れる
+_PLAIN_CMD_ARG_RE = re.compile(r"[A-Za-z0-9_.:/\\-]+")
 
 AGENT_CHOICES = ("claude", "codex", "both")
 AGENT_NAMES = ("claude", "codex")
@@ -50,6 +76,12 @@ UPDATED = "updated"
 UNCHANGED = "unchanged"
 SKIPPED_FOREIGN = "skipped-foreign"      # 自分が書いた記録が無いファイル
 SKIPPED_MODIFIED = "skipped-modified"    # 自分が書いたが、その後手で編集されている
+REPLACED_BLOCK = "replaced-block"        # マーカー間だけ差し替えた（マーカー外は保った）
+
+# 規約の状態（doctor 用）。「無い」と「古い」を分けるのは、直し方が違うため
+CONVENTION_OK = "ok"
+CONVENTION_ABSENT = "absent"
+CONVENTION_OUTDATED = "outdated"
 
 _CONVENTION_BODY = """\
 このプロジェクトは **uapp-dash**（ローカルのエージェント開発ダッシュボード）で監視されている。
@@ -164,7 +196,7 @@ def render(target: str) -> str:
     """
     if target == "codex":
         # 本文の見出しが `##` なので、ルートの AGENTS.md では `#` を 1 本だけ立てる
-        head = "# AGENTS.md — エージェント開発ステータスの申告規約\n\n"
+        head = "# AGENTS.md ― エージェント開発ステータスの申告規約\n\n"
     else:
         head = "# エージェント開発ステータスの申告規約\n\n"
     return f"{BEGIN_MARKER}\n{head}{_CONVENTION_BODY}{END_MARKER}\n"
@@ -172,6 +204,11 @@ def render(target: str) -> str:
 
 def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_newlines(text: str) -> str:
+    """テキストとして読み込んだときの形（改行を LF に揃える）。所有記録のハッシュ用。"""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _manifest_path(status_dir: Path) -> Path:
@@ -250,9 +287,19 @@ def _write_atomic(path: Path, text: str) -> None:
     直接書くと、途中で落ちたときに半端なファイルが残る。それは記録とも一致しないため
     「手が入った」と判定され、以後の自動更新が永久に止まる。
     """
+    _write_atomic_bytes(path, text.encode("utf-8"))
+
+
+def _write_atomic_bytes(path: Path, data: bytes) -> None:
+    """`_write_atomic` のバイト版。
+
+    マーカー間だけを差し替えるときは、**マーカー外をバイト列のまま残す**必要がある
+    （テキストとして読み書きすると CRLF が LF に変わり、触っていないはずの行まで
+    ユーザーの diff に出る）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
+    tmp.write_bytes(data)
     try:
         os.replace(tmp, path)
     except OSError as exc:
@@ -267,25 +314,83 @@ def _write_atomic(path: Path, text: str) -> None:
         ) from exc
 
 
-def _place(path: Path, text: str, recorded: str | None) -> str:
-    """自分が書いた記録があり、現物がその通りのときだけ更新する。"""
+def _splice_block(path: Path, block: str) -> str | None:
+    """管理領域だけを差し替え、**その外側はバイト列のまま**残す。
+
+    戻り値は差し替え後の内容（所有記録用に改行を正規化したもの）。差し替えられなければ None。
+
+    テキストとして読み書きすると CRLF が LF に化け、触っていないはずの行までユーザーの
+    diff に出る（「マーカー外には一切触れない」という約束が崩れる）。UTF-8 として読めない
+    ファイルは、書き戻すと不正バイトが `U+FFFD` に化けるので触らない。
+    """
+    try:
+        current = path.read_bytes().decode("utf-8")      # 改行を変換しない読み方
+    except UnicodeDecodeError:
+        return None
+    blocks = _managed_blocks(current)
+    if len(blocks) != 1:
+        return None
+    new_block = block.strip()
+    if "\r\n" in blocks[0]:                              # 現物の改行に合わせる（差分を増やさない）
+        new_block = new_block.replace("\r\n", "\n").replace("\n", "\r\n")
+    if new_block == blocks[0]:
+        return None
+    # **最初の 1 つだけ**を置き換える（`str.replace` は全置換なので使わない）
+    head, _, tail = current.partition(blocks[0])
+    spliced = head + new_block + tail
+    _write_atomic_bytes(path, spliced.encode("utf-8"))
+    return _normalize_newlines(spliced)
+
+
+def _place(path: Path, text: str, recorded: str | None,
+           *, replace_block: bool = False) -> tuple[str, str | None]:
+    """自分が書いた記録があり、現物がその通りのときだけ更新する。
+
+    戻り値は `(結果コード, 置いた内容のハッシュ)`。**ハッシュは判断に使った内容から作る**
+    （書いた後に現物を読み直すと、その隙にユーザーが保存した内容を「自分の物」として
+    記録してしまい、次の更新でユーザーのファイルを丸ごと上書きしうる）。
+    更新しなかった場合は None を返す。
+
+    `replace_block=True`（`init --replace-marker-block`）のときは、**マーカー間だけを
+    差し替える**経路を追加で許す。マーカー外に自作の規約を足している構成では、更新のたびに
+    「手が入っている」として全文が標準出力に貼られ、人が 100 行を手で貼り直していた
+    （導入先で 3 版連続で発生。手作業は必ず事故る）。管理領域は begin/end で明示されており、
+    その外側には一切触れないので、オプトインなら安全に自動化できる。
+    """
     if not path.exists():
         _write_atomic(path, text)
-        return CREATED
+        return CREATED, _digest(text)
     current = path.read_text(encoding="utf-8", errors="replace")
     # 中身がこれから書く内容と完全一致するなら、記録の状態に関わらず自分の生成物として扱ってよい
     # （書き込み後・記録の保存前に落ちた場合の回復経路。書き換えは起きないので無害）
     if current == text:
-        return UNCHANGED
+        return UNCHANGED, _digest(current)
+    untouched = recorded is not None and _digest(current) == recorded
+    # 管理領域がちょうど 1 つのときだけ差し替えられる。0 個なら差し込む場所が決められず、
+    # 2 個以上ならどれが現行か判断できない（どちらも人に任せる）
+    blocks = _managed_blocks(current)
+    # マーカー外にユーザーの内容があるファイルは、**記録と一致していても全文置換してはいけない**
+    # （前回ブロックだけ差し替えた結果、記録＝現物だがマーカー外はユーザーのもの、という状態になる）
+    keeps_own_content = len(blocks) == 1 and current.strip() != blocks[0].strip()
+    if len(blocks) == 1 and (replace_block or (untouched and keeps_own_content)):
+        spliced = _splice_block(path, text)
+        if spliced is not None:
+            return REPLACED_BLOCK, _digest(spliced)
+        if blocks[0] == text.strip():
+            return UNCHANGED, _digest(current)      # 管理領域は既に現行
+        # 安全に差し替えられなかった（UTF-8 として読めない等）。**触らずに人へ返す**
+        # （ここで自分の物として記録すると、次の版でユーザーのファイルを全文上書きしうる）
+        return SKIPPED_MODIFIED, None
     if recorded is None:
-        return SKIPPED_FOREIGN                      # ユーザーのファイル（マーカーの有無で判断しない）
-    if _digest(current) != recorded:
-        return SKIPPED_MODIFIED                     # 自分の生成物だが手が入っている
+        return SKIPPED_FOREIGN, None                # ユーザーのファイル（マーカーの有無で判断しない）
+    if not untouched:
+        return SKIPPED_MODIFIED, None               # 自分の生成物だが手が入っている
     _write_atomic(path, text)
-    return UPDATED
+    return UPDATED, _digest(text)
 
 
-def install(project_root: Path, agents: str, *, status_dir: Path) -> list[dict]:
+def install(project_root: Path, agents: str, *, status_dir: Path,
+            replace_block: bool = False) -> list[dict]:
     """申告規約を配置する。戻り値は `{agent, path, status}` の一覧（表示は呼び手の仕事）。
 
     記録の読み書きと配置は **OS のファイルロックで囲んだ排他区間**で行う。囲まないと、
@@ -309,9 +414,14 @@ def install(project_root: Path, agents: str, *, status_dir: Path) -> list[dict]:
             path = project_root / relpath
             text = render(agent)
             key = relpath.as_posix()
-            status = _place(path, text, files.get(key))
-            if status in (CREATED, UPDATED, UNCHANGED):
-                files[key] = _digest(text)
+            # **記録は「置いた内容」から取る**。マーカー間だけ差し替えた場合、現物は
+            # render(agent) と一致しない（マーカー外はユーザーのもの）ので、text の
+            # ハッシュを入れると次回「手が入っている」と誤判定して二度と更新できなくなる。
+            # かといって書いた後に現物を読み直すと、その隙にユーザーが保存した内容を
+            # 「自分の物」として記録し、次の版で丸ごと上書きしうる（`_place` が返す値を使う）
+            status, digest = _place(path, text, files.get(key), replace_block=replace_block)
+            if digest is not None:
+                files[key] = digest
             results.append({"agent": agent, "path": path, "status": status})
             # **配置ごとに記録する**。最後にまとめて書くと、途中で落ちたときに
             # 「ファイルは在るが所有記録が無い」＝以後ずっと更新できない状態が残る
@@ -323,24 +433,71 @@ def install(project_root: Path, agents: str, *, status_dir: Path) -> list[dict]:
 
 
 def _managed_blocks(text: str) -> list[str]:
-    """begin/end で挟まれた管理領域を取り出す（対応が壊れていれば空）。"""
+    """begin/end で挟まれた管理領域を取り出す（対応が壊れていれば空）。
+
+    **開始マーカーが入れ子になっている形は「壊れている」として拒否する**。
+    ここを緩くすると、ユーザーの記述中にあるマーカー文字列と本物の終端が一組と見なされ、
+    差し替えのときに間に挟まれたユーザーの記述ごと消える。
+
+    **マーカーは「その行に単独で在る」ものだけを認める**（`render` はそう書き出す）。
+    行の途中に現れた文字列は本文の一部として扱う ― マーカーを*説明している*文章
+    （`Start with <!-- … begin -->` のような散文）を管理領域と誤認すると、
+    `--replace-marker-block` がその間のユーザーの記述を消してしまう。
+    検出できなければ「無い」ことになり、手で統合する経路へ落ちるだけなので安全側に倒れる。
+    """
     blocks: list[str] = []
     cursor = 0
     while True:
-        begin = text.find(BEGIN_MARKER, cursor)
-        if begin < 0:
+        m_begin = _BEGIN_LINE_RE.search(text, cursor)
+        if not m_begin:
             break
-        end = text.find(END_MARKER, begin)
-        if end < 0:
+        m_end = _END_LINE_RE.search(text, m_begin.end())
+        if not m_end:
             return []                      # 開始だけあって終端が無い＝壊れている
-        stop = end + len(END_MARKER)
-        blocks.append(text[begin:stop])
-        cursor = stop
+        if _BEGIN_LINE_RE.search(text, m_begin.end(), m_end.start()):
+            return []                      # 開始が二重＝どこからどこまでが管理領域か決められない
+        blocks.append(text[m_begin.start():m_end.end()])
+        cursor = m_end.end()
     return blocks
 
 
-def convention_present(project_root: Path) -> dict[str, bool]:
-    """**現行の規約が過不足なくそこにあるか**（doctor 用）。手で統合された場合も見つける。
+def quote_for_cmd(value) -> str:
+    """案内文に埋め込むコマンド引数を、そのままコピペできる形にする（PowerShell 想定）。
+
+    プロジェクトのパスに空白が入っていると（`D:\\Work Space\\App` は普通にある）、
+    引用しない案内をコピペした人のところで `--project` が途中で切れる。
+    **直し方を示す文が、その通りにやると動かない**のは案内として成立しない。
+
+    危ないのは空白だけではない。`&` `;` `(` などは Windows のパスとして**正当**なのに
+    PowerShell では構文上の意味を持つ（`D:\\A&B` を裸で貼ると `B` を別コマンドとして
+    実行しようとする）。そこで**安全と分かる文字だけで出来ているとき以外は必ず引用する**。
+    引用は単引用符にする ― 二重引用符だと `$` が変数展開されてしまい、`$` を含むパスで壊れる。
+    単引用符自体は 2 つ重ねてエスケープする（PowerShell の規則）。
+    """
+    text = str(value)
+    if _PLAIN_CMD_ARG_RE.fullmatch(text):
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
+def has_managed_block(path: Path) -> bool:
+    """そのファイルに差し替え可能な管理領域がちょうど 1 つあるか（案内の出し分け用）。"""
+    path = Path(path)
+    if not path.exists():
+        return False
+    return len(_managed_blocks(path.read_text(encoding="utf-8", errors="replace"))) == 1
+
+
+def convention_state(project_root: Path) -> dict[str, str]:
+    """規約の状態を 3 値で返す（doctor 用）。手で統合された場合も見つける。
+
+    `CONVENTION_OK` … 現行の規約が過不足なくある
+    `CONVENTION_OUTDATED` … **管理領域はあるが中身が現行と違う**（＝旧版が置かれている）
+    `CONVENTION_ABSENT` … ファイルが無い、管理領域が無い、または複数ある
+
+    「未配置」と「旧版が配置されている」を分けるのは、**直し方が違う**ため。
+    前者はファイルを作ればよく、後者は既存ファイルの管理領域を差し替える必要がある
+    （手で全文を貼り直すと事故るので `init --replace-marker-block` を案内する）。
 
     マーカーや骨の文言だけを見ると、古い版の規約や、heartbeat・排他・エビデンス分離を
     削った本文でも「配置済み」になる。逆に「現行の全文を含むか」だけを見ると、
@@ -349,18 +506,27 @@ def convention_present(project_root: Path) -> dict[str, bool]:
     その中身が現行と一致することまで確かめる。
     """
     project_root = Path(project_root)
-    found = {}
+    state = {}
     for agent, relpath in RELPATHS.items():
         path = project_root / relpath
         if not path.exists():
-            found[agent] = False
+            state[agent] = CONVENTION_ABSENT
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         blocks = _managed_blocks(text)
-        if len(blocks) != 1 or blocks[0] != render(agent).strip():
-            found[agent] = False
+        if len(blocks) != 1:
+            state[agent] = CONVENTION_ABSENT
+            continue
+        if blocks[0] != render(agent).strip():
+            state[agent] = CONVENTION_OUTDATED
             continue
         # 旧形式（1 行マーカー）の規約が同居していないか。新形式だけを数えると、
         # 移行時に「旧規約を残して新スニペットを追記した」状態を見逃す
-        found[agent] = LEGACY_MARKER not in text.replace(blocks[0], "")
-    return found
+        state[agent] = (CONVENTION_OK if LEGACY_MARKER not in text.replace(blocks[0], "")
+                        else CONVENTION_OUTDATED)
+    return state
+
+
+def convention_present(project_root: Path) -> dict[str, bool]:
+    """現行の規約が過不足なくそこにあるか（`convention_state` の bool 版）。"""
+    return {agent: st == CONVENTION_OK for agent, st in convention_state(project_root).items()}
