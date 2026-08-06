@@ -79,13 +79,26 @@ def derive(unit: dict, *, now: datetime | None = None, grace: int = P.STALL_GRAC
 
     if declared == "done":
         result = unit.get("result") or "success"
-        state = {"success": "done", "failure": "failed", "aborted": "aborted"}.get(result, "done")
+        state = {"success": "done", "failure": "failed", "aborted": "aborted",
+                 "dropped": "dropped"}.get(result, "done")
+        superseded_by = unit.get("supersededBy")
+        if state == "dropped":
+            # 取りやめ＝再開しない意図的な打ち切り。宿題が無いので要注意には出さない
+            # （CATEGORY_OF_STATE に無い＝category None）。理由だけ残す
+            reasons.append("取りやめで終了（再開しない）")
+            return _derived(state, declared, reasons, warnings, 0, None, acknowledged)
         if state != "done":
             reasons.append(f"{'失敗' if state == 'failed' else '中断'}で終了: "
                            f"{(unit.get('result') or '')}")
+            if superseded_by:
+                # 「打ち切ったが目的は別単位で達成した」― 宿題は残っていないので、
+                # ack と同じ扱いで要注意から外す（導入先報告: 消去法の aborted が
+                # 要注意欄に居座り、未処理の宿題に見えていた）
+                reasons.append(f"引き継ぎ済み（→ {superseded_by}）")
             if acknowledged:
                 reasons.append(f"確認済み（{unit.get('acknowledgedAt')}）")
-        return _derived(state, declared, reasons, warnings, 0, None, acknowledged)
+        return _derived(state, declared, reasons, warnings, 0, None,
+                        acknowledged or bool(superseded_by))
 
     heartbeat, warn = P.parse_iso_safe(unit.get("lastHeartbeat") or unit.get("startedAt"))
     if warn:

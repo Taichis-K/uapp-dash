@@ -449,6 +449,39 @@ def cmd_end(args) -> int:
     unit = _load_unit(store, unit_id)
     if args.result not in P.RESULTS:
         raise SystemExit(f"--result は {P.RESULTS} のいずれか")
+    superseded_by = getattr(args, "superseded_by", None)
+    # 「指定あり」は None 判定で見る（真偽値だと `--superseded-by ""` が未指定扱いになり、
+    # 保留値の継承へ流れて古い引き継ぎ先を拾う ― 再レビュー指摘。空文字は形式検証で拒否される）
+    if superseded_by is not None:
+        # 「打ち切ったが目的は別単位で達成した」を表現する（導入先要望: AI 運用では
+        # セッション終了で単位が切れ、後日別単位で同じ目的を達成することが頻繁に起きる。
+        # 消去法の aborted だと未処理の宿題に見え、要注意欄に居座る）
+        if args.result == "success":
+            raise SystemExit("--superseded-by は failure / aborted 用"
+                             "（success はそれ自体が達成なので引き継ぎ先を持たない）")
+        if args.result == "dropped":
+            raise SystemExit("--superseded-by は failure / aborted 用"
+                             "（dropped は目的ごとやめた終わり方。目的を別単位が"
+                             "引き継いだのなら aborted --superseded-by を使う）")
+        if not P.valid_unit_id(superseded_by):
+            raise SystemExit(f"--superseded-by が unitId の形式ではありません: {superseded_by!r}")
+        if superseded_by == unit_id:
+            raise SystemExit("--superseded-by に自分自身は指定できません")
+    elif args.result in ("failure", "aborted"):
+        # EXIT_CONFLICT で保留された前回の end に付いていた --superseded-by を引き継ぐ
+        # （外部レビュー指摘: 保留→再試行で付け忘れると、最初の指定が黙って消えて
+        # 要注意欄へ戻る）。dropped へ変えた再試行には引き継がない（併用拒否と同じ理由）。
+        # **引き継ぐ値も明示指定と同じ検証を通す**（pendingEnd は外部が書けるファイル由来。
+        # 検証を迂回すると自己参照や不正 ID で要注意を消せてしまう ― 再レビュー指摘）。
+        # ただし不正でも end は止めない: SystemExit にすると壊れた記録で二度と閉じられなくなる
+        pending = unit.get("pendingEnd")
+        value = pending.get("supersededBy") if isinstance(pending, dict) else None
+        if value is not None:
+            if isinstance(value, str) and P.valid_unit_id(value) and value != unit_id:
+                superseded_by = value
+            else:
+                print(f"保留されていた supersededBy は不正な値のため引き継がない: {value!r}",
+                      file=sys.stderr)
     warn_self_reported_numbers(args.summary, "--summary")
     # 掴んだままの排他資源を解放してから終わる（取り残しロックを作らない）。
     # 「今は触れない（busy）」だけを未解決として残す。「記録が無い」「別の単位が取り直した」は
@@ -471,6 +504,8 @@ def cmd_end(args) -> int:
         unit["blocked"] = {"reason": f"終了処理で排他資源を解放できない: {', '.join(busy)}",
                            "needs": "resource", "resource": busy[0]}
         unit["pendingEnd"] = {"result": args.result, "summary": args.summary}
+        if superseded_by:
+            unit["pendingEnd"]["supersededBy"] = superseded_by
         _touch(unit)
         _bump_event_count(store, unit, "claim.blocked", dict(unit["blocked"]))
         store.write_unit(unit)
@@ -482,12 +517,27 @@ def cmd_end(args) -> int:
     unit["state"] = "done"
     unit["result"] = args.result
     unit["endedAt"] = P.now_iso()
+    if superseded_by:
+        unit["supersededBy"] = superseded_by
     unit.pop("blocked", None)
     unit.pop("pendingEnd", None)
     _touch(unit)
-    _bump_event_count(store, unit, "claim.end", {"result": args.result, "summary": args.summary})
+    end_data = {"result": args.result, "summary": args.summary}
+    if superseded_by:
+        end_data["supersededBy"] = superseded_by
+    _bump_event_count(store, unit, "claim.end", end_data)
     store.write_unit(unit)
     store.archive_unit(unit_id)
+    if args.result in ("failure", "aborted") and not superseded_by:
+        # **後始末の導線をその場で示す**（導入先報告: ack はリリースノートで知っていても
+        # 規約に無い手順は AI が実行しない。--help にしか無い機能は使われない）。
+        # コマンドは**そのままコピーして動く完全形**で出す（外部レビュー指摘:
+        # `--result` と `--unit-id` を欠いた案内は、コピー実行すると argparse で失敗する）
+        print("この単位は要注意欄に残ります。対処済みなら"
+              f" `uapp-dash ack --unit-id {unit_id} --note \"対処内容\"`、"
+              "別の単位で目的を達成した（する）なら"
+              f" `uapp-dash end --unit-id {unit_id} --result {args.result}"
+              " --superseded-by <後続の unitId>` で閉じ直せます", file=sys.stderr)
     return EXIT_OK
 
 
@@ -571,7 +621,7 @@ def cmd_units(args) -> int:
     project = aggregate.build_project(store.project_root)
     units = project["units"]
     if not args.all:
-        units = [u for u in units if (u.get("derived") or {}).get("state") not in ("done", "failed", "aborted", "idle")]
+        units = [u for u in units if (u.get("derived") or {}).get("state") not in ("done", "failed", "aborted", "dropped", "idle")]
     if args.json:
         print(json.dumps([{k: u.get(k) for k in ("unitId", "label", "state", "activity", "owner",
                                                  "startedAt", "lastHeartbeat", "claims", "resources")}
@@ -687,6 +737,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_end = sub.add_parser("end", help="開発単位を終了する")
     p_end.add_argument("--result", required=True, choices=P.RESULTS)
     p_end.add_argument("--summary")
+    p_end.add_argument("--superseded-by", metavar="UNIT_ID",
+                       help="この単位の目的を引き継いで達成した（する）後続の unitId。"
+                            "failure / aborted と併用すると一覧に「引き継ぎ済み」と出て、"
+                            "要注意欄に残らない（本当に手当てが要る中断と区別できる）")
     p_end.add_argument("--unit-id")
     p_end.set_defaults(func=cmd_end)
 

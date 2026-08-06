@@ -344,7 +344,9 @@ def build_project(project_root: Path, *, now: datetime | None = None) -> dict:
 
     conflicts = claims_mod.find_conflicts(enriched)
     ordered = attention.sort_units(enriched, now=now)
-    active = [u for u in ordered if (u.get("derived") or {}).get("state") not in ("done", "idle")]
+    # dropped（取りやめ）は done と同じく「畳まれる終わり」。active に数えると
+    # 取りやめた単位が「進行中」として居座り、新設した意味が無くなる（外部レビュー指摘）
+    active = [u for u in ordered if (u.get("derived") or {}).get("state") not in ("done", "dropped", "idle")]
     running = [u for u in ordered if (u.get("derived") or {}).get("state") == "running"]
     project = {
         "name": Path(project_root).name,

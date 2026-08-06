@@ -29,11 +29,12 @@ ATTENTION_ORDER = (
     "review",
     "running",
     "done",
+    "dropped",
     "idle",
 )
 
 # 終端状態（もう自分では動かない）。表示側が独自判定しないよう集約が配る
-TERMINAL_STATES = ("done", "failed", "aborted")
+TERMINAL_STATES = ("done", "failed", "aborted", "dropped")
 
 # 要注意の種類。人が取るべき行動が違うので分ける（表示の並びもこの順）
 #   human    … 人が動かないと進まない（承認・入力・調整）
@@ -50,7 +51,10 @@ CATEGORY_OF_STATE = {
     "stalled": "watch",
 }
 
-RESULTS = ("success", "failure", "aborted")
+# dropped は「**再開しない**と決めた打ち切り」（意図的な取りやめ・目的自体が不要になった）。
+# aborted（外的要因で切れた＝宿題が残りうる → 要注意に出す）と使い分ける。
+# 再開されない中断が要注意欄・一覧に赤く残り続けると、本当に手が要るものが埋もれる（実運用の指摘）
+RESULTS = ("success", "failure", "aborted", "dropped")
 NEEDS = ("approval", "input", "resource")
 TASK_STATUSES = ("todo", "done", "dropped")
 

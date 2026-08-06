@@ -104,7 +104,12 @@ flowchart LR
 - **スナップショットを書いてよいのはその単位の所有者だけ**。エビデンスを書く道具は
   **ジャーナルに追記するだけ**にする（共有ファイルの read-modify-write は他コマンドの更新を巻き戻す）
 - `state` の宣言可能値: `running` / `waiting-approval` / `blocked` / `review` / `done`
-- `result`（`state=done` のとき）: `success` / `failure` / `aborted`
+- `result`（`state=done` のとき）: `success` / `failure` / `aborted` / `dropped`
+  - `dropped` は 0.1.6 で追加（**再開しないと決めた取りやめ**。宿題が残りうる `aborted` と
+    使い分け、要注意にも進行中にも出さない）。旧読み手が未知の `result` を読んだ場合は
+    `done` として畳む（読み手は未知の語彙で止まらない）
+  - `supersededBy`（任意・0.1.6 で追加）: `failure` / `aborted` の単位が「目的を引き継いだ
+    別単位」を指す。読み手は ack と同様に要注意から外す
 
 ### 表示順（要注意ファースト）
 
@@ -116,7 +121,7 @@ flowchart LR
 5. stalled           TTL 超過（プロセスは生存）
 6. review            レビュー待ち
 7. running           実行中
-8. done / idle       完了・待機
+8. done / dropped / idle  完了・取りやめ・待機
 ```
 
 同順位内は「最後の更新からの経過時間」の降順。**時系列ソートは既定にしない**。
@@ -168,7 +173,7 @@ flowchart LR
 | `claim.blocked` | `reason, needs: approval\|input\|resource, resource?` | `needs=approval` が最優先表示 |
 | `claim.note` | `text` | 補足。表示は最下位 |
 | `claim.resource` | `resource, action: acquire\|release\|denied, holder?` | エージェント自身による排他資源の取得/解放（実装時に追加。ツールが書くものは `evidence.resource`） |
-| `claim.end` | `result: success\|failure\|aborted, summary` | 掴んでいる排他資源を解放し、単位を `units/done/` へ移す。**`busy` の資源が残る場合は `done` にせず `blocked`（needs=resource）のまま失敗させる**（`done` にすると集約でも表示でも畳まれ、塞がった資源が視界から消える）。ジャーナルは**切り離してから追記マージ**する（退避中の追記を失わない） |
+| `claim.end` | `result: success\|failure\|aborted\|dropped, summary, supersededBy?` | 掴んでいる排他資源を解放し、単位を `units/done/` へ移す。**`busy` の資源が残る場合は `done` にせず `blocked`（needs=resource）のまま失敗させる**（`done` にすると集約でも表示でも畳まれ、塞がった資源が視界から消える）。ジャーナルは**切り離してから追記マージ**する（退避中の追記を失わない） |
 
 **申告テキストに数字を書かせない**: `claim.end` の `summary` と `claim.heartbeat` の `activity` に
 テスト件数らしき数字（`39/39`・`2 failed`・`15 件通過` 等）があれば、CLI が**警告を 1 行出す**

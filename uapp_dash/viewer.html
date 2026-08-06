@@ -211,6 +211,8 @@
   .st-review { --c: var(--violet); }
   .st-running { --c: var(--blue); }
   .st-done { --c: var(--green); }
+  /* 取りやめ＝再開しない意図的な打ち切り。赤（中断）とは違い、宿題が残っていないので中立色 */
+  .st-dropped { --c: var(--slate); }
   .st-idle { --c: var(--slate); }
 
   /* ---------- スマホ（片手で「手が要るか」を判断できることだけに絞る） ---------- */
@@ -258,8 +260,15 @@
      自己完結 HTML の制約は崩さない（別ページではなく同一ファイル内のビュー切替） */
   /* main は display:grid を持つため、hidden 属性だけでは消えない（実測で両方描画された） */
   [hidden] { display: none !important; }
+  /* パンくずは常時見える位置に固定する（スクロールで隠れると、戻るために
+     いちいち最上部までスクロールする羽目になる ― 実運用の指摘） */
   .crumbs { display: flex; gap: calc(8px * var(--scale)); align-items: center; flex-wrap: wrap;
-            font-size: calc(12px * var(--scale)); color: var(--muted); margin-bottom: calc(10px * var(--scale)); }
+            font-size: calc(12px * var(--scale)); color: var(--muted); margin-bottom: calc(10px * var(--scale));
+            /* ヘッダーも sticky（top:0, z-index:30）なので、その実高の直下に貼り付ける。
+               top:0 のままだとヘッダーと重なって覆う（特にモバイルはヘッダーが折り返して背が高い）。
+               --header-h はスクリプトが ResizeObserver で実測して与える */
+            position: sticky; top: var(--header-h, 0px); z-index: 20; background: var(--bg);
+            padding: calc(6px * var(--scale)) 0; }
   .crumbs a { color: var(--blue); text-decoration: none; }
   .crumbs a:hover { text-decoration: underline; }
   .dhead { display: flex; align-items: baseline; gap: calc(10px * var(--scale)); flex-wrap: wrap;
@@ -332,7 +341,7 @@ const FLEET = /*__FLEET_DATA__*/null;
 const STATE = {
   "waiting-approval": {label: "承認待ち", glyph: "⏳"}, "blocked": {label: "ブロック", glyph: "⛔"},
   "crashed": {label: "プロセス消失", glyph: "💀"}, "failed": {label: "失敗", glyph: "✖"},
-  "aborted": {label: "中断", glyph: "⊘"}, "stalled": {label: "停滞", glyph: "⏸"},
+  "aborted": {label: "中断", glyph: "⊘"}, "dropped": {label: "取りやめ", glyph: "⊘"}, "stalled": {label: "停滞", glyph: "⏸"},
   "review": {label: "レビュー待ち", glyph: "👁"}, "running": {label: "実行中", glyph: "▶"},
   "done": {label: "完了", glyph: "✔"}, "idle": {label: "待機", glyph: "·"}
 };
@@ -519,7 +528,7 @@ function projectCard(project, index, showDone) {
 
   const units = (project.units || []).filter(u => {
     const state = stateOf(u);
-    return showDone || (state !== "done" && state !== "idle");
+    return showDone || (state !== "done" && state !== "dropped" && state !== "idle");
   }).slice(0, 2);
   units.forEach((unit, index) => {
     const state = stateOf(unit);
@@ -550,7 +559,7 @@ function projectCard(project, index, showDone) {
   details.append(el("div", {class: "micro", style: "letter-spacing:.02em;text-transform:none"}, project.path));
   for (const unit of project.units || []) {
     const state = stateOf(unit);
-    if (!showDone && (state === "done" || state === "idle")) continue;
+    if (!showDone && (state === "done" || state === "dropped" || state === "idle")) continue;
     const block = el("div", {style: "margin-top:8px", "data-unit": unit.unitId || ""});
     block.append(el("div", {class: "unitline st-" + state},
       el("span", {class: "dot"}), el("span", {class: "label"}, unit.label || unit.unitId),
@@ -757,7 +766,8 @@ function drawUnitDetail(fleet, project, unit) {
     ["いま", unit.activity || "—"],
     ["進捗", prog.total ? `${prog.done}/${prog.total - (prog.dropped || 0)}` : "—"],
   ];
-  if (derived.acknowledged) rows.push(["確認済み", unit.acknowledgedAt + (unit.acknowledgedNote ? "（" + unit.acknowledgedNote + "）" : "")]);
+  if (unit.supersededBy) rows.push(["引き継ぎ先", unit.supersededBy + "（この単位の目的は後続で達成済み）"]);
+  if (derived.acknowledged && unit.acknowledgedAt) rows.push(["確認済み", unit.acknowledgedAt + (unit.acknowledgedNote ? "（" + unit.acknowledgedNote + "）" : "")]);
   for (const [k, v] of rows) { kv.append(el("span", {class: "k"}, k), el("span", {}, v)); }
   info.append(kv);
   for (const reason of derived.reasons || []) info.append(el("div", {class: "unitsub", style: "color:var(--amber);margin-left:0"}, "▸ " + reason));
@@ -983,6 +993,13 @@ try {
   document.body.classList.toggle("tv", tvMode.checked);
 } catch (e) { /* 参照できない環境では既定のまま */ }
 applyTheme();
+// パンくずの貼り付き位置に使うヘッダー実高（折り返し・スケール・TV モードで変わるので実測で追従）
+{
+  const headerEl = document.querySelector("header");
+  const setHeaderH = () => document.documentElement.style.setProperty("--header-h", headerEl.offsetHeight + "px");
+  setHeaderH();
+  new ResizeObserver(setHeaderH).observe(headerEl);
+}
 // 戻る/進む・URL 直打ち・リンクのどれでも同じ経路で描き直す（ビューの状態は hash だけが持つ）
 window.addEventListener("hashchange", () => { window.scrollTo(0, 0); draw(current); });
 draw(current);
