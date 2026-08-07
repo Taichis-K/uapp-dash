@@ -306,9 +306,12 @@ def _parse_tasks(spec: str | None) -> list[dict]:
     return tasks
 
 
-def _supersedes_problem(old_unit: dict | None, supersedes: str) -> str | None:
-    """`--supersedes` の対象として不適なら理由を返す（適格なら None）。
+def _supersedes_problem(old_unit: dict | None, supersedes: str, *,
+                        option: str = "--supersedes", running_hint: str | None = None) -> str | None:
+    """引き継ぎ元（旧単位）として不適なら理由を返す（適格なら None）。
 
+    begin --supersedes と amend の両方から使う（option は文言用。running_hint は
+    「まだ終了していない」場合の案内で、コマンドごとに正しい導線が違う）。
     **fail-closed**: `state == "done"` かつ result が failure / aborted / dropped の
     ときだけ通す。`TERMINAL_STATES` で見ると外部の書き手由来の `state=failed` 等も
     通ってしまうが、attention が supersededBy を解決するのは `state=="done"` の
@@ -317,22 +320,22 @@ def _supersedes_problem(old_unit: dict | None, supersedes: str) -> str | None:
     if old_unit is None:
         # end --superseded-by と違い実在を要求する（こちらは過去を指すので、
         # 見つからないのは打ち間違い。unitId は uapp-dash units --all で探せる）
-        return (f"--supersedes の単位が見つからない: {supersedes}"
+        return (f"{option} の単位が見つからない: {supersedes}"
                 "（uapp-dash units --all で unitId を確認できます）")
     if old_unit.get("state") != "done":
-        return (f"--supersedes の単位はまだ終了していません: {supersedes}"
-                f"（state={old_unit.get('state')}）。先にこの begin を"
-                " --supersedes なしで実行し、旧単位を `uapp-dash end --unit-id"
-                f" {supersedes} --result aborted --superseded-by <新しい unitId>`"
-                " で閉じてください")
+        hint = running_hint or (" 先にこの begin を --supersedes なしで実行し、旧単位を"
+                                f" `uapp-dash end --unit-id {supersedes} --result aborted"
+                                " --superseded-by <新しい unitId>` で閉じてください")
+        return (f"{option} の単位はまだ終了していません: {supersedes}"
+                f"（state={old_unit.get('state')}）。{hint.strip()}")
     result = old_unit.get("result")
     if result == "success":
-        return (f"--supersedes の単位は success で終わっています: {supersedes}"
+        return (f"{option} の単位は success で終わっています: {supersedes}"
                 "（success はそれ自体が達成なので引き継ぎ先を持たない）")
     if result not in ("failure", "aborted", "dropped"):
         # 欠損・未知の値は通さない（外部が書けるファイル由来。fail-open にすると
         # 壊れた記録へ「引き継ぎ済み」を付けられてしまう）
-        return (f"--supersedes の単位の result が不正です: {supersedes}"
+        return (f"{option} の単位の result が不正です: {supersedes}"
                 f"（result={result!r}。failure / aborted / dropped のみ引き継げます）")
     existing = old_unit.get("supersededBy")
     if existing:
@@ -343,7 +346,7 @@ def _supersedes_problem(old_unit: dict | None, supersedes: str) -> str | None:
         hint = result if result in ("failure", "aborted") else "aborted"
         note = ("。dropped の単位を end で閉じ直すと result は aborted に変わります"
                 if result == "dropped" else "")
-        return (f"--supersedes の単位は既に {existing} へ引き継ぎ済みです: {supersedes}"
+        return (f"{option} の単位は既に {existing} へ引き継ぎ済みです: {supersedes}"
                 "（付け替えるなら `uapp-dash end --unit-id"
                 f" {supersedes} --result {hint} --superseded-by <後続の unitId>`"
                 f" で明示的に閉じ直してください{note}）")
@@ -666,8 +669,56 @@ def cmd_end(args) -> int:
               f" `uapp-dash end --unit-id {unit_id} --result {args.result}"
               " --superseded-by <後続の unitId>` で閉じ直せます"
               "（後続をこれから作るなら、そのとき"
-              f" `uapp-dash begin --supersedes {unit_id} ...` でも同じ記録になります）",
+              f" `uapp-dash begin --supersedes {unit_id} ...` でも同じ記録になります。"
+              "後続が既に在るなら"
+              f" `uapp-dash amend --unit-id {unit_id} --superseded-by <後続の unitId>`"
+              " が結果の語彙を変えずに引き継ぎだけ記録します）",
               file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_amend(args) -> int:
+    """終了済みの単位に引き継ぎ先（supersededBy）を後付けする。
+
+    `begin --supersedes` は「これから作る単位」からの宣言なので、**既に両方閉じている
+    2 単位を後から結ぶ経路が無かった**（導入先要望・0.1.7 受け入れ時）。ack が「後から
+    対処を書ける」のと同じ後始末の追記。結果の語彙（failure / aborted / dropped）は変えない
+    ＝語彙ごと変えたいときは end での閉じ直し（--superseded-by 同時指定）を使う。
+    """
+    store = _store(args)
+    unit_id = _resolve_unit_id(args)
+    superseded_by = args.superseded_by
+    if not P.valid_unit_id(superseded_by):
+        raise SystemExit(f"--superseded-by が unitId の形式ではありません: {superseded_by!r}")
+    if superseded_by == unit_id:
+        raise SystemExit("--superseded-by に自分自身は指定できません")
+    # **後続の実在を要求する**（amend は既に存在する 2 単位を結ぶ操作。end --superseded-by が
+    # 実在を要求しないのは「これから作る後続」を許すためで、amend にその事情は無い＝typo は止める）
+    if store.read_unit(superseded_by) is None:
+        raise SystemExit(f"--superseded-by の単位が見つからない: {superseded_by}"
+                         "（uapp-dash units --all で unitId を確認できます）")
+    # begin --supersedes と同じ規律: 旧単位のロック内で読み直し→検証→snapshot→journal
+    with file_lock(store.lock_path(store.done_dir / f"{unit_id}.json")):
+        unit = store.read_unit(unit_id)
+        problem = _supersedes_problem(
+            unit, unit_id, option="--unit-id",
+            running_hint="進行中の単位は `uapp-dash end --unit-id"
+                         f" {unit_id} --result aborted --superseded-by {superseded_by}`"
+                         " で閉じるときに引き継ぎ先を付けてください")
+        if problem:
+            raise SystemExit(problem)
+        seq = int(unit.get("eventCount") or 0) + 1
+        unit["supersededBy"] = superseded_by
+        unit["eventCount"] = seq
+        store.write_unit(unit)
+        try:
+            store.append_event(unit_id, "claim.supersede", {"by": superseded_by},
+                               P.PRODUCER_AGENT, seq=seq)
+        except Exception as exc:  # noqa: BLE001 ＝ リンクは成立済み。嘘をつかない
+            print(f"引き継ぎは記録済み（ジャーナルへのイベント追記だけ失敗: {exc}。"
+                  "履歴表示に 1 行欠けるが実害はない）", file=sys.stderr)
+            return EXIT_OK
+    print(f"{unit_id} を引き継ぎ済みにした（→ {superseded_by}。結果の語彙は変えない）")
     return EXIT_OK
 
 
@@ -753,8 +804,12 @@ def cmd_units(args) -> int:
     if not args.all:
         units = [u for u in units if (u.get("derived") or {}).get("state") not in ("done", "failed", "aborted", "dropped", "idle")]
     if args.json:
+        # result / supersededBy は導入先要望（0.1.7 受け入れ時）で追加: セッション開始時に
+        # 「閉じ忘れ・引き継ぎ漏れ」を CLI だけで機械点検したい。スナップショットには
+        # 元からあるのに、ここで落としていた（未終了の単位では null になる）
         print(json.dumps([{k: u.get(k) for k in ("unitId", "label", "state", "activity", "owner",
-                                                 "startedAt", "lastHeartbeat", "claims", "resources")}
+                                                 "startedAt", "lastHeartbeat", "claims", "resources",
+                                                 "result", "supersededBy")}
                           | {"derivedState": (u.get("derived") or {}).get("state"),
                              # **`state: running` と期限切れは両立する**。切れているとツール側の
                              # 記録は ambient に落ちるので、残り秒と期限切れを一次情報として出す
@@ -781,6 +836,10 @@ def cmd_units(args) -> int:
             (unit.get("label") or "")[:32], (unit.get("activity") or "")[:40]))
         print("{:<26} {} / 最終更新 {} / {}".format(
             "", owner.get("agent") or "?", unit.get("lastHeartbeat") or "?", ttl_text))
+        if unit.get("supersededBy"):
+            # ビューアーを開かずに CLI だけで「宙に浮いているのか引き継がれたのか」を
+            # 判別できるようにする（AI は CLI しか見ない ― 導入先要望）
+            print("{:<26} 引き継ぎ済み → {}".format("", unit.get("supersededBy")))
     return EXIT_OK
 
 
@@ -883,6 +942,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ack.add_argument("--note", help="確認した内容（対応済み・既知の問題 等）")
     p_ack.set_defaults(func=cmd_ack)
 
+    p_amend = sub.add_parser("amend", help="終了済みの単位に引き継ぎ先を後付けする（結果の語彙は変えない）")
+    p_amend.add_argument("--unit-id", help="引き継ぎ元（failure / aborted / dropped で終了済みの単位）")
+    p_amend.add_argument("--superseded-by", metavar="UNIT_ID", required=True,
+                         help="目的を引き継いだ後続の unitId（実在する単位のみ。"
+                              "begin --supersedes と違い、両方が既に存在するときに使う）")
+    p_amend.set_defaults(func=cmd_amend)
+
     p_res = sub.add_parser("resource", help="排他資源の取得/解放")
     p_res.add_argument("action", choices=["acquire", "release"])
     p_res.add_argument("resource_id", help=f"例: editor-play:<path> / device:<serial>:<port>（接頭辞 {P.RESOURCE_PREFIXES}）")
@@ -910,8 +976,8 @@ def build_parser() -> argparse.ArgumentParser:
     # `uapp-dash view --project X` のようにサブコマンドの後ろへ書いても通るようにする
     # （前にしか置けないと、素直に書いた側が「unrecognized arguments」で弾かれる）。
     # default=SUPPRESS ＝ 指定が無ければグローバル側の値を上書きしない
-    for subparser in (p_init, p_doctor, p_begin, p_hb, p_task, p_blocked, p_end, p_res, p_view,
-                      p_units, p_show):
+    for subparser in (p_init, p_doctor, p_begin, p_hb, p_task, p_blocked, p_end, p_ack, p_amend,
+                      p_res, p_view, p_units, p_show):
         subparser.add_argument("--project", default=argparse.SUPPRESS,
                                help="対象プロジェクト（uapp-dash --project と同じ。どちらの位置でもよい）")
     return parser
