@@ -86,6 +86,10 @@ def derive(unit: dict, *, now: datetime | None = None, grace: int = P.STALL_GRAC
             # 取りやめ＝再開しない意図的な打ち切り。宿題が無いので要注意には出さない
             # （CATEGORY_OF_STATE に無い＝category None）。理由だけ残す
             reasons.append("取りやめで終了（再開しない）")
+            if superseded_by:
+                # begin --supersedes による後日の宣言（取りやめ後に目的が復活した）。
+                # 要注意の扱いは変わらない＝もともと出ていないが、行き先は表示する
+                reasons.append(f"引き継ぎ済み（→ {superseded_by}）")
             return _derived(state, declared, reasons, warnings, 0, None, acknowledged)
         if state != "done":
             reasons.append(f"{'失敗' if state == 'failed' else '中断'}で終了: "

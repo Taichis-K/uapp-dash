@@ -425,8 +425,9 @@ function eventText(ev) {
   if (ev.kind === "claim.task") return `タスク ${d.taskId} → ${d.status}`;
   if (ev.kind === "claim.blocked") return `ブロック（${d.needs}）: ${d.reason || ""}`;
   if (ev.kind === "claim.heartbeat") return `${d.state}${d.activity ? " / " + d.activity : ""}`;
-  if (ev.kind === "claim.begin") return `開始: ${d.label || ""}`;
+  if (ev.kind === "claim.begin") return `開始: ${d.label || ""}${d.supersedes ? "（" + d.supersedes + " を引き継ぎ）" : ""}`;
   if (ev.kind === "claim.end") return `終了: ${d.result} ${d.summary || ""}`;
+  if (ev.kind === "claim.supersede") return `引き継ぎ済みにされた（→ ${d.by || "?"}）`;
   if (ev.kind === "claim.resource") return `資源 ${d.action}: ${d.resource}`;
   if (ev.kind === "evidence.test" || ev.kind === "evidence.e2e") {
     const total = (d.passed || 0) + (d.failed || 0);

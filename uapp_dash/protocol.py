@@ -66,6 +66,7 @@ CLAIM_KINDS = (
     "claim.note",
     "claim.resource",  # 実装時に追加: エージェント自身による資源の取得/解放宣言
     "claim.ack",       # 実装時に追加: 終了済みの失敗・中断を人が「確認した」と記録する
+    "claim.supersede",  # 0.1.7 で追加: 後続の begin --supersedes が旧単位へ引き継ぎ先を記録する
     "claim.end",
 )
 EVIDENCE_KINDS = (

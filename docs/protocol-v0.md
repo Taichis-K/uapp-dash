@@ -109,7 +109,14 @@ flowchart LR
     使い分け、要注意にも進行中にも出さない）。旧読み手が未知の `result` を読んだ場合は
     `done` として畳む（読み手は未知の語彙で止まらない）
   - `supersededBy`（任意・0.1.6 で追加）: `failure` / `aborted` の単位が「目的を引き継いだ
-    別単位」を指す。読み手は ack と同様に要注意から外す
+    別単位」を指す。読み手は ack と同様に要注意から外す。
+    **書き込み経路は 2 つ**（0.1.7 で後者を追加）: ①`end --superseded-by`（閉じるとき同時に）
+    ②後続の `begin --supersedes <旧unitId>`（閉じた後から。旧単位が `failure` / `aborted` /
+    `dropped` で終了済み・**引き継ぎ先が未設定**のときだけ許可。`dropped` にも付けられるのは、
+    end 時の同時宣言と違い「取りやめた後に目的が復活した」は矛盾ではないため。
+    結果の語彙は変えない。既に引き継ぎ先がある単位への再指定は拒否＝付け替えは①の
+    閉じ直しに限る。**①経由の復旧・付け替えは end の意味論に従う**ため、`dropped` だった
+    単位を①で閉じ直すと result は `aborted` へ変わる（CLI はその旨を案内文に明示する））
 
 ### 表示順（要注意ファースト）
 
@@ -167,7 +174,8 @@ flowchart LR
 
 | kind | data | 備考 |
 |---|---|---|
-| `claim.begin` | `label, tasks[], claims[], owner` | 単位の開始。unitId を採番して返す |
+| `claim.begin` | `label, tasks[], claims[], owner, supersedes?` | 単位の開始。unitId を採番して返す。`supersedes`（0.1.7 で追加）は目的を引き継ぐ旧単位の unitId |
+| `claim.supersede` | `by` | 0.1.7 で追加。後続の `begin --supersedes` が**旧単位側**のジャーナルへ書く（`by` = 後続の unitId）。旧単位のスナップショットには `supersededBy` が入る |
 | `claim.heartbeat` | `state, activity, ttlSec, progress?` | 生存＋現在の作業。長時間処理の前に `ttlSec` を伸ばす。**状態も作業内容も変わらない場合はスナップショットのみ更新し、ジャーナルには書かない**（肥大化防止） |
 | `claim.task` | `taskId, status: done\|dropped, note?` | 消化率の元データ |
 | `claim.blocked` | `reason, needs: approval\|input\|resource, resource?` | `needs=approval` が最優先表示 |

@@ -14,7 +14,7 @@ from pathlib import Path
 from . import (__version__, agents as agents_mod, aggregate, attention, claims as claims_mod,
                console, doctor as doctor_mod, protocol as P, render, shims)
 from .store import (RELEASE_BUSY, RELEASE_NOT_OWNER, RELEASE_SETTLED, StatusStore, default_owner,
-                    git_exclude_path, gitignore_candidates, has_status_dir_entry)
+                    file_lock, git_exclude_path, gitignore_candidates, has_status_dir_entry)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -306,6 +306,50 @@ def _parse_tasks(spec: str | None) -> list[dict]:
     return tasks
 
 
+def _supersedes_problem(old_unit: dict | None, supersedes: str) -> str | None:
+    """`--supersedes` の対象として不適なら理由を返す（適格なら None）。
+
+    **fail-closed**: `state == "done"` かつ result が failure / aborted / dropped の
+    ときだけ通す。`TERMINAL_STATES` で見ると外部の書き手由来の `state=failed` 等も
+    通ってしまうが、attention が supersededBy を解決するのは `state=="done"` の
+    畳みだけなので、「CLI は成功と言うのに要注意から外れない」不整合になる（レビュー指摘）。
+    """
+    if old_unit is None:
+        # end --superseded-by と違い実在を要求する（こちらは過去を指すので、
+        # 見つからないのは打ち間違い。unitId は uapp-dash units --all で探せる）
+        return (f"--supersedes の単位が見つからない: {supersedes}"
+                "（uapp-dash units --all で unitId を確認できます）")
+    if old_unit.get("state") != "done":
+        return (f"--supersedes の単位はまだ終了していません: {supersedes}"
+                f"（state={old_unit.get('state')}）。先にこの begin を"
+                " --supersedes なしで実行し、旧単位を `uapp-dash end --unit-id"
+                f" {supersedes} --result aborted --superseded-by <新しい unitId>`"
+                " で閉じてください")
+    result = old_unit.get("result")
+    if result == "success":
+        return (f"--supersedes の単位は success で終わっています: {supersedes}"
+                "（success はそれ自体が達成なので引き継ぎ先を持たない）")
+    if result not in ("failure", "aborted", "dropped"):
+        # 欠損・未知の値は通さない（外部が書けるファイル由来。fail-open にすると
+        # 壊れた記録へ「引き継ぎ済み」を付けられてしまう）
+        return (f"--supersedes の単位の result が不正です: {supersedes}"
+                f"（result={result!r}。failure / aborted / dropped のみ引き継げます）")
+    existing = old_unit.get("supersededBy")
+    if existing:
+        # 黙った付け替えを許さない（レビュー指摘: ジャーナルに claim.supersede が複数、
+        # スナップショットは最後の 1 件だけ、という壊れた履歴になる）。
+        # 付け替えは明示操作＝end での閉じ直しだけに限る（end は dropped を受けないので、
+        # dropped だった単位の案内は aborted への閉じ直しになる。**語彙が変わることは黙らない**）
+        hint = result if result in ("failure", "aborted") else "aborted"
+        note = ("。dropped の単位を end で閉じ直すと result は aborted に変わります"
+                if result == "dropped" else "")
+        return (f"--supersedes の単位は既に {existing} へ引き継ぎ済みです: {supersedes}"
+                "（付け替えるなら `uapp-dash end --unit-id"
+                f" {supersedes} --result {hint} --superseded-by <後続の unitId>`"
+                f" で明示的に閉じ直してください{note}）")
+    return None
+
+
 def cmd_begin(args) -> int:
     store = _store(args)
     store.ensure()
@@ -315,6 +359,28 @@ def cmd_begin(args) -> int:
     unit_id = args.unit_id or P.make_unit_id()
     if not P.valid_unit_id(unit_id):
         raise SystemExit(f"不正な単位 ID: {unit_id!r}")
+    # --supersedes は**新しい単位を作る前に**全部検証する（作った後に落とすと、
+    # 「単位はできたが引き継ぎは記録されない」中途半端な状態で終了コードだけ非ゼロになる）。
+    # 導入先要望: 打ち切る時点では後続の unitId がまだ存在しないことが多く、
+    # `end --superseded-by` は渡す値が無い。後続を作る側からなら旧 id は必ず分かる
+    supersedes = getattr(args, "supersedes", None)
+    if supersedes is not None:
+        if not P.valid_unit_id(supersedes):
+            raise SystemExit(f"--supersedes が unitId の形式ではありません: {supersedes!r}")
+        if supersedes == unit_id:
+            raise SystemExit("--supersedes に自分自身は指定できません")
+        _old = store.read_unit(supersedes)
+        problem = _supersedes_problem(_old, supersedes)
+        if problem:
+            raise SystemExit(problem)
+        # 記録失敗時の復旧コマンド用（end --superseded-by は dropped を受けないので、
+        # dropped だった単位の復旧は aborted への閉じ直しになる ＝ end 自身の案内と同じ線）
+        supersedes_hint_result = _old.get("result") if _old.get("result") in ("failure", "aborted") else "aborted"
+        supersedes_was_dropped = _old.get("result") == "dropped"
+        # dropped は許可する。end 時の同時宣言（--result dropped --superseded-by）は
+        # 「再開しない」と「後続がある」の矛盾なので拒否しているが、**閉じた後に
+        # 目的が復活して後続ができた**のは矛盾ではなく新しい事実。結果の語彙は変えない
+        # （dropped のまま。要注意の扱いも変わらない＝もともと出ていない）
     owner = default_owner(agent=args.agent, session=args.session, unit_id=unit_id, pid=args.pid)
     claim_values, claim_offenders = claims_mod.split_separators(args.claims or [])
     unit = {
@@ -336,13 +402,74 @@ def cmd_begin(args) -> int:
         "endedAt": None,
         "result": None,
     }
-    _bump_event_count(
-        store,
-        unit,
-        "claim.begin",
-        {"label": unit["label"], "tasks": unit["tasks"], "claims": unit["claims"], "owner": owner},
-    )
+    begin_data = {"label": unit["label"], "tasks": unit["tasks"], "claims": unit["claims"],
+                  "owner": owner}
+    if supersedes is not None:
+        begin_data["supersedes"] = supersedes
+    _bump_event_count(store, unit, "claim.begin", begin_data)
     store.write_unit(unit)
+    if supersedes is not None:
+        # 旧単位側へ引き継ぎ先を記録する（end --superseded-by と同じフィールド。
+        # 読み手＝attention / viewer は既にこのフィールドで解決する）。
+        # **ここからは失敗しても begin を落とさない**（本流＝新単位の作成は成功している。
+        # ここで異常終了すると unitId が stdout に出ないまま新単位だけが残り、
+        # 再実行で重複単位が生まれる ＝ レビュー指摘）。失敗時は復旧コマンドを示す
+        try:
+            # **旧単位のロックを取り、読み直し〜書き込みをその中で行う**（再々レビュー指摘:
+            # ロック無しだと 2 本の begin --supersedes が同時に再読込して両方検証を通過し、
+            # 「claim.supersede 2 件・supersededBy は最後の 1 件」の壊れた履歴が再発する）。
+            # ロック名は unit id から決定的に導出する（スナップショットの実体が units/ と
+            # done/ のどちらに居ても同じロックで直列化されるように）。
+            # 取得タイムアウトは下の except に落ちて警告＋復旧コマンドになる
+            with file_lock(store.lock_path(store.done_dir / f"{supersedes}.json")):
+                # **書き込む直前に読み直して、最新の状態に対して適用する**（冒頭の検証から
+                # ここまでの間に別プロセスが旧単位を動かしていた場合、検証時の古い
+                # スナップショットで書き戻すと ack や success への再終了を巻き戻す ＝ レビュー指摘）
+                fresh = store.read_unit(supersedes)
+                if fresh is not None and fresh.get("result") in ("failure", "aborted", "dropped"):
+                    # 復旧コマンドの --result は**最新の**値に合わせる（再レビュー指摘:
+                    # 検証時の値で固定すると、再読込後の書き込み失敗時に古い result を
+                    # 案内し、コピー実行が有効な閉じ直しを巻き戻す）。dropped は end が
+                    # --superseded-by を受けないので aborted への閉じ直しを案内する（初回と同じ規則）
+                    _r = fresh.get("result")
+                    supersedes_hint_result = _r if _r in ("failure", "aborted") else "aborted"
+                    supersedes_was_dropped = _r == "dropped"
+                problem = _supersedes_problem(fresh, supersedes)
+                if problem:
+                    print(f"引き継ぎは記録しなかった（begin 後に旧単位の状態が変わった）: {problem}",
+                          file=sys.stderr)
+                else:
+                    # **スナップショットを先に書き、ジャーナルは後**（4 周目レビュー指摘:
+                    # 逆順だとスナップショット書き込み失敗時に「成功扱いの claim.supersede」
+                    # だけが残り、再試行の成功でイベントが複数に増える。この順なら
+                    # 失敗した試行は痕跡を残さず、イベント追記だけの失敗はリンク成立済み
+                    # ＋表示履歴 1 行欠けの実害小で済む）
+                    seq = int(fresh.get("eventCount") or 0) + 1
+                    fresh["supersededBy"] = unit_id
+                    fresh["eventCount"] = seq
+                    store.write_unit(fresh)
+                    try:
+                        store.append_event(supersedes, "claim.supersede", {"by": unit_id},
+                                           P.PRODUCER_AGENT, seq=seq)
+                    except Exception as append_exc:  # noqa: BLE001
+                        # リンクは成立している。**「失敗した」と嘘をつかない**
+                        print(f"引き継ぎは記録済み（ジャーナルへのイベント追記だけ失敗: "
+                              f"{append_exc}。履歴表示に 1 行欠けるが実害はない）",
+                              file=sys.stderr)
+                    else:
+                        print(f"{supersedes} を引き継ぎ済みにした（→ この単位。結果の語彙は変えない）",
+                              file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 ＝ 申告は補助。本流の begin を巻き添えにしない
+            # dropped の復旧は end 経由しかなく result が aborted へ変わる。
+            # **黙って語彙を書き換える案内はしない**（再々レビュー指摘）。
+            # dropped はもともと要注意に出ないので、リンク無しのまま放置しても実害は
+            # viewer の行き先表示だけ ＝ それも案内して選ばせる
+            note = ("（旧単位は dropped のため、このコマンドで result は aborted に変わります。"
+                    "語彙を保ちたい場合はリンク無しのままでも要注意には出ません）"
+                    if supersedes_was_dropped else "")
+            print(f"引き継ぎの記録に失敗した: {exc}。あとから"
+                  f" `uapp-dash end --unit-id {supersedes} --result {supersedes_hint_result}"
+                  f" --superseded-by {unit_id}` で記録し直せます{note}", file=sys.stderr)
     aggregate.register_project(project_root)
     _warn_claim_separators(claim_offenders)
     warn_self_reported_numbers(args.activity, "--activity")
@@ -537,7 +664,10 @@ def cmd_end(args) -> int:
               f" `uapp-dash ack --unit-id {unit_id} --note \"対処内容\"`、"
               "別の単位で目的を達成した（する）なら"
               f" `uapp-dash end --unit-id {unit_id} --result {args.result}"
-              " --superseded-by <後続の unitId>` で閉じ直せます", file=sys.stderr)
+              " --superseded-by <後続の unitId>` で閉じ直せます"
+              "（後続をこれから作るなら、そのとき"
+              f" `uapp-dash begin --supersedes {unit_id} ...` でも同じ記録になります）",
+              file=sys.stderr)
     return EXIT_OK
 
 
@@ -708,6 +838,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_begin.add_argument("--session", help="セッション識別子")
     p_begin.add_argument("--pid", type=int, help="持続プロセスの pid（生存判定に使う。無ければ判定しない）")
     p_begin.add_argument("--unit-id", help="単位 ID を明示指定する")
+    p_begin.add_argument("--supersedes", metavar="UNIT_ID",
+                         help="この単位が目的を引き継ぐ旧単位の unitId（failure / aborted / dropped で"
+                              "終了済みのもの）。旧単位に supersededBy を記録し「引き継ぎ済み」にする"
+                              "（end --superseded-by の逆向き。閉じる時点で後続が無くても後から宣言できる）")
     p_begin.set_defaults(func=cmd_begin)
 
     p_hb = sub.add_parser("heartbeat", help="生存と現在の作業を更新する")
