@@ -37,7 +37,10 @@ INSTALL_HINT = ("リポジトリ直下で `pip install -e .`（または `pip in
 
 # **「入れたはずなのに無い / 動かない」の典型はウイルス対策**。pip が作る launcher exe は
 # 未署名で、隔離・実行ブロック・解析待ちのどれもが「pip install は成功したのに使えない」形で出る。
-# 原因に見当が付かないと `pip install` を何度も繰り返すことになるので、候補として必ず出す
+# 原因に見当が付かないと `pip install` を何度も繰り返すことになるので、候補として出す。
+# ただし **Windows 限定**（launcher が exe になるのは Windows だけ。POSIX の launcher は
+# 素の Python スクリプトで隔離対象にならず、この案内は誤った調査へ誘導するノイズになる ―
+# 実際に macOS で「PATH に無いだけ」の状況をウイルス対策の方向へ誤誘導した。issue #14）
 ANTIVIRUS_HINT = (
     "`pip install` が成功しているのにこうなる場合、**ウイルス対策が launcher exe を隔離/ブロック**"
     "している可能性がある（未署名かつレピュテーションが無いため。隔離ログを確認する）。"
@@ -70,13 +73,14 @@ def _run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
     壊れたインストールでも [済] になる。
     """
     kwargs.setdefault("env", _child_env())
+    kwargs.setdefault("timeout", 60)
     with tempfile.TemporaryDirectory() as outside:
         kwargs.setdefault("cwd", outside)
         return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=60, **kwargs)
+                              errors="replace", **kwargs)
 
 
-def _responds(exe: str, expected: str) -> tuple[bool, str]:
+def _responds(exe: str, expected: str, *, timeout: int = 60) -> tuple[bool, str]:
     """**実際に起動して**自分のコマンドかを確かめる。
 
     `shutil.which` は名前が見つかったことしか言わない（古い shim・import に失敗する
@@ -84,7 +88,7 @@ def _responds(exe: str, expected: str) -> tuple[bool, str]:
     「パーサーは起動するが中身は別物/別版」を弾けないので、版まで突き合わせる。
     """
     try:
-        result = _run([exe, "--help"])
+        result = _run([exe, "--help"], timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"起動できない: {exc}"
     if result.returncode != 0:
@@ -92,7 +96,7 @@ def _responds(exe: str, expected: str) -> tuple[bool, str]:
     if expected not in (result.stdout or ""):
         return False, f"別のコマンドの応答に見える（'{expected}' が出力に無い）"
     try:
-        version = _run([exe, "--version"])
+        version = _run([exe, "--version"], timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"--version を実行できない: {exc}"
     reported = ((version.stdout or "") + (version.stderr or "")).strip()
@@ -158,25 +162,141 @@ def _expected_script_dir() -> Path | None:
     return dirs[0] if dirs else None
 
 
-def _missing_hint(name: str) -> str:
-    """PATH に無い／動かないときのヒント。**在るべき場所を具体的に示す**。
+def _launcher_filename(name: str) -> str:
+    """pip が置く launcher のファイル名。**Windows だけ exe になる**。
 
-    「PATH に見つからない」だけでは、入れ忘れなのか消されたのかが分からない。
-    インストール先に exe が無ければ隔離を強く疑えるし、在るのに動かないなら実行ブロックを疑える。
+    POSIX の launcher は拡張子なしの Python スクリプト。ここを `.exe` 固定にすると
+    POSIX では実在確認が必ず空振りし、「在るのに無い扱い」で誤った案内に流れる（issue #14）。
+    """
+    return f"{name}.exe" if os.name == "nt" else name
+
+
+def _module_form(name: str) -> str:
+    """launcher を使わない読み替え先（`python -m …`）。"""
+    return "python -m uapp_dash.emit" if name == "uapp-dash-emit" else "python -m uapp_dash"
+
+
+def _path_add_line(directory: Path) -> str:
+    """PATH へ足す 1 行（そのまま貼れる形で。シェルごとに書き方が違う）。
+
+    パスは二重引用符へ埋め込まない（`$` を含むパスが展開され、`"` を含む合法なパスは
+    引用から脱出する）。**単引用符で括ってエスケープする** ― `install-shims` と同じ扱い。
+    """
+    raw = str(directory)
+    if os.name == "nt":
+        return "$env:PATH = '" + raw.replace("'", "''") + ";' + $env:PATH"
+    return "export PATH='" + raw.replace("'", "'\\''") + ":'\"$PATH\""
+
+
+def _probe_env_ok() -> bool:
+    """launcher の実走確認（`_run`）が使う一時ディレクトリを作れる環境か。
+
+    作れないと `_responds` は起動前に失敗し、健全な launcher まで「壊れている」に
+    見えてしまう。プローブの土台の故障と launcher の故障を混ぜない。
+    """
+    try:
+        with tempfile.TemporaryDirectory():
+            return True
+    except OSError:
+        return False
+
+
+def _shebang_of(path: str | None) -> str | None:
+    """launcher の 1 行目（shebang）が指すインタープリタ。読めなければ None。"""
+    if not path:
+        return None
+    try:
+        first = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    if not first.startswith("#!"):
+        return None
+    interp = first[2:].strip()
+    # pip/distlib は Python パスに空白がある・長すぎる等のとき shebang を `#!/bin/sh` の
+    # トランポリンにする。それを Python と誤認すると `/bin/sh -m …` という無効な案内になる。
+    # `python` を名乗る実体（`/usr/bin/env python3` 形式を含む）だけを信用する
+    if not interp or "python" not in interp.lower():
+        return None
+    return interp
+
+
+def _missing_hint(name: str) -> str:
+    """`shutil.which` で見つからないときのヒント。
+
+    **「launcher が無い」と「launcher はあるが PATH に無い」を区別する**（issue #14）。
+    後者に再インストールやウイルス対策の話をしても対処にならない
+    （実際に macOS で誤った方向へ調査を誘導した）。候補ディレクトリを実際に見に行き、
+    実体が見つかったら「PATH へ足す 1 行」と「`python -m` へ読み替え」だけを出す。
+    """
+    launcher = _launcher_filename(name)
+    dirs = _script_dirs()
+    present = [d / launcher for d in dirs if (d / launcher).exists()]
+    if present and not _probe_env_ok():
+        # プローブの土台（一時ディレクトリ）が無い環境では、実走できないことを
+        # launcher の故障と誤診しない。**確かめられなかったことを正直に言う**
+        listed = "、".join(str(p) for p in present)
+        return (f"launcher の実体は {listed} に在る（この環境では実走確認ができなかった）。"
+                f"PATH に無いだけの可能性が高い。PATH へ足す: `{_path_add_line(present[0].parent)}`。"
+                f"足さずに運用するなら `{name} …` を `{_module_form(name)} …` に読み替える")
+    # **実在確認だけで「PATH に無いだけ」と言い切らない**。実行権が無い・別版・壊れた
+    # インストールでも exists() は通り、その場合 PATH へ足しても直らない。実走で確かめる
+    # （タイムアウトは短く。ハングする launcher の診断で doctor 自体を数分止めない）
+    probed = [(p, *_responds(str(p), f"usage: {name}", timeout=10)) for p in present]
+    working = [p for p, ok, _ in probed if ok]
+    if working:
+        listed = "、".join(str(p) for p in working)
+        return (f"**launcher は {listed} に在って応答する＝PATH に入っていないだけ**。"
+                f"PATH へ足す: `{_path_add_line(working[0].parent)}`"
+                "（恒久化はシェルの初期化ファイルや環境変数の設定へ）。"
+                f"足さずに運用するなら `{name} …` を `{_module_form(name)} …` に読み替える")
+    if present:
+        # 実体はあるが実走で応答しない＝PATH の問題ではない。**理由は候補ごとに対で示す**
+        listed = "、".join(f"{p}（{why}）" for p, _, why in probed)
+        parts = [f"{listed} に実体はあるが、実走すると使えない。"
+                 "**PATH へ足しても直らない**", INSTALL_HINT]
+        if os.name == "nt":
+            parts.append(ANTIVIRUS_HINT)
+        return " / ".join(parts)
+    parts = [INSTALL_HINT]
+    if any(d.is_dir() for d in dirs):
+        listed = "、".join(str(d / launcher) for d in dirs if d.is_dir())
+        # 探索できるのは sysconfig が答える候補まで。**見ていない場所を「無い」と断定しない**
+        # （pipx・別 venv・Homebrew prefix 不一致では候補の外に居る）
+        parts.append(f"**確認した候補 {listed} には存在しない**（作られていないか、"
+                     "消されているか、pipx・別の venv などこの候補以外の場所に入っている）")
+    elif dirs:
+        parts.append("確認した候補: " + "、".join(str(d) for d in dirs))
+    if os.name == "nt":
+        parts.append(ANTIVIRUS_HINT)
+    return " / ".join(parts)
+
+
+def _broken_hint(name: str, exe: str | None = None, *, suggest_probe: bool = True) -> str:
+    """PATH には在るのに応答しない／動かないときのヒント。
+
+    こちらは「見つからない」ではないので PATH の話はしない。壊れたインストールの
+    入れ直しと、Windows なら実行ブロック（ウイルス対策）を疑わせる。
+
+    `suggest_probe=False` は round-trip（init 実走）失敗用 ― そこでは `--help` /
+    `--version` が既に通っているので、版切り分けの案内は的外れになる。
     """
     parts = [INSTALL_HINT]
-    dirs = _script_dirs()
-    present = [d for d in dirs if (d / f"{name}.exe").exists()]
-    if present:
-        # **在るのに使えないなら入れ忘れではない**。PATH か実行ブロックを疑わせる
-        parts.append(f"インストール先: {present[0]}"
-                     "（exe は在る＝PATH に入っていないか、実行がブロックされている）")
-    elif os.name == "nt" and any(d.is_dir() for d in dirs):
-        listed = "、".join(str(d / f"{name}.exe") for d in dirs if d.is_dir())
-        parts.append(f"**インストール先に {listed} が存在しない**（作られていないか、消されている）")
-    elif dirs:
-        parts.append("インストール先: " + "、".join(str(d) for d in dirs))
-    parts.append(ANTIVIRUS_HINT)
+    if os.name == "nt":
+        parts.append(ANTIVIRUS_HINT)
+    elif suggest_probe:
+        # **素の python では切り分けにならない**（別の Python や作業ツリーの本体を拾いうる。
+        # SETUP の注意と同じ）。launcher の shebang が読めるなら、その実体を具体的に出す
+        mod = _module_form(name).removeprefix("python -m ")
+        interp = _shebang_of(exe)
+        if interp:
+            parts.append(f"切り分け: `{interp} -m {mod} --version`"
+                         "（launcher と同じ Python）を試す。動くなら launcher 側だけの問題"
+                         "（入れ直しで戻る）")
+        else:
+            parts.append(f"切り分け: `python -m {mod} --version` を **launcher と同じ Python**"
+                         "（launcher 1 行目の shebang が指す実体）で試す。それが動くなら"
+                         " launcher 側だけの問題（入れ直しで戻る）。素の `python` は別の環境を"
+                         "拾いうるので切り分けには使わない")
     return " / ".join(parts)
 
 
@@ -282,22 +402,36 @@ def _check_ps1_shims(shim_paths: list[str]) -> list[dict]:
 def _check_commands() -> list[dict]:
     checks = []
     shim_paths = []
+    # **診断の土台が壊れている環境では launcher を「壊れている」と言わない**。
+    # `_run` は一時ディレクトリを要求するので、それが無いと健全な launcher まで
+    # 「起動できない」に化ける（実走確認の失敗と launcher の故障を混ぜない）
+    probe_ok = _probe_env_ok()
+    if not probe_ok:
+        checks.append(_check(NG, "診断の土台（一時ディレクトリ）が使える",
+                             "一時ディレクトリを作成できない ― コマンドの実走確認ができない",
+                             "TMP / TEMP（POSIX は TMPDIR）が実在する書き込み可能な場所を"
+                             "指しているか確認する。この状態で launcher の健全性は判定できない"
+                             "（launcher の故障とは限らない）"))
     for name in ("uapp-dash", "uapp-dash-emit"):
         exe = shutil.which(name)
         if not exe:
             checks.append(_check(NG, f"コマンド {name} が使える", "PATH に見つからない",
                                  _missing_hint(name)))
             continue
+        if not probe_ok:
+            checks.append(_check(INFO, f"コマンド {name} が使える",
+                                 f"{exe} ― 見つかったが、実走確認はできなかった（上の [未] 参照）"))
+            continue
         ok, detail = _responds(exe, f"usage: {name}")
         if not ok:
             checks.append(_check(NG, f"コマンド {name} が使える", f"{exe} ― {detail}",
-                                 _missing_hint(name)))
+                                 _broken_hint(name, exe)))
             continue
         if name == "uapp-dash":
             works, why = _round_trip(exe)
             if not works:
                 checks.append(_check(NG, "コマンド uapp-dash が実際に動く", f"{exe} ― {why}",
-                                     _missing_hint(name)))
+                                     _broken_hint(name, exe, suggest_probe=False)))
                 continue
         checks.append(_check(OK, f"コマンド {name} が使える", exe))
         if _is_shim(exe):
